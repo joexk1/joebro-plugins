@@ -1,0 +1,18 @@
+{
+  "name": "joebro",
+  "version": "1.0.0",
+  "description": "Links Claude Code to JoeBro: sessions show in the JoeBro app and Dynamic Island, JoeBro can message and steer them, and Claude can ping your phone and build JoeBro plugins.",
+  "author": {
+    "name": "joexk1"
+  },
+  "homepage": "https://joebro.pages.dev",
+  "repository": "https://github.com/joexk1/joebro-plugins",
+  "license": "MIT",
+  "keywords": [
+    "joebro",
+    "agents",
+    "mcp",
+    "notifications",
+    "plugins"
+  ]
+}

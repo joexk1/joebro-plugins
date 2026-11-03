@@ -1,0 +1,28 @@
+{
+  "schema": "joebro.plugin/1",
+  "id": "plant-care",
+  "name": "Plant care",
+  "version": "1.0.0",
+  "description": "Remembers when each plant was last watered, tells JoeBro which ones are due, and gives you a panel to tick them off.",
+  "author": "joexk1",
+  "permission": "sandbox",
+  "runtime": {"type": "python", "entry": "tools.py"},
+  "contributes": {
+    "tools": [
+      {"name": "plants_due",
+       "description": "List plants that are due (or overdue) for watering, with days since last watered. Use when the user asks about their plants or what needs doing at home.",
+       "parameters": {"type": "object", "properties": {}}},
+      {"name": "plant_watered",
+       "description": "Record that a plant was just watered. Use when the user says they watered a plant.",
+       "parameters": {"type": "object", "properties": {"plant": {"type": "string"}}, "required": ["plant"]}},
+      {"name": "plant_add",
+       "description": "Start tracking a plant and how often it needs water (days).",
+       "parameters": {"type": "object", "properties": {"plant": {"type": "string"}, "every_days": {"type": "integer", "minimum": 1, "maximum": 60}}, "required": ["plant"]}},
+      {"name": "plants_all",
+       "description": "Every tracked plant with its schedule and when it was last watered.",
+       "parameters": {"type": "object", "properties": {}}}
+    ],
+    "guardrail": "When the user mentions having watered a plant, record it with plant_watered.",
+    "panels": [{"id": "plants", "title": "Plants", "icon": "leaf", "entry": "ui/index.html"}]
+  }
+}

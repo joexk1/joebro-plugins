@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Plants</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1d1d1f; --mute: #6e6e73; --card: rgba(255,255,255,.55); --line: rgba(0,0,0,.08); --due: #e8590c; --ok: #2f9e44; }
+  @media (prefers-color-scheme: dark) { :root { --fg: #f5f5f7; --mute: #a1a1a6; --card: rgba(255,255,255,.06); --line: rgba(255,255,255,.1); } }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 20px; font: 14px/1.4 -apple-system, system-ui, sans-serif; color: var(--fg); background: transparent; }
+  h1 { font-size: 20px; margin: 0 0 4px; } p.sub { margin: 0 0 16px; color: var(--mute); }
+  ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+  li { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border-radius: 14px; background: var(--card); border: 1px solid var(--line); }
+  .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--ok); flex: none; }
+  li.due .dot { background: var(--due); box-shadow: 0 0 0 4px color-mix(in srgb, var(--due) 25%, transparent); }
+  .name { font-weight: 600; } .meta { color: var(--mute); font-size: 12px; } .grow { flex: 1; }
+  button { font: inherit; border: 0; border-radius: 10px; padding: 7px 12px; background: var(--fg); color: Canvas; cursor: pointer; }
+  form { display: flex; gap: 8px; margin-top: 16px; }
+  input { font: inherit; flex: 1; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); color: var(--fg); }
+  input[type=number] { flex: 0 0 72px; }
+  .empty { color: var(--mute); padding: 24px 0; text-align: center; }
+</style></head>
+<body>
+  <h1>Plants</h1><p class="sub" id="sub">Loading…</p>
+  <ul id="list"></ul>
+  <form id="add"><input id="name" placeholder="Add a plant" required><input id="every" type="number" min="1" max="60" value="7" title="Water every N days"><button>Add</button></form>
+<script>
+  const list = document.getElementById("list"), sub = document.getElementById("sub");
+  async function render() {
+    const plants = await joebro.call("plants_all", {});
+    const due = plants.filter(p => p.due).length;
+    sub.textContent = plants.length ? (due ? `${due} need water` : "All watered") : "No plants yet";
+    list.innerHTML = plants.length ? "" : '<li class="empty">Add your first plant below.</li>';
+    for (const p of plants) {
+      const li = document.createElement("li");
+      li.className = p.due ? "due" : "";
+      const since = p.days_since === null ? "never watered" : `${p.days_since} days ago`;
+      li.innerHTML = `<span class="dot"></span><div class="grow"><div class="name"></div><div class="meta">${since} · every ${p.every_days} days</div></div><button>Watered</button>`;
+      li.querySelector(".name").textContent = p.plant;
+      li.querySelector("button").onclick = async () => { await joebro.call("plant_watered", {plant: p.plant}); render(); };
+      list.appendChild(li);
+    }
+  }
+  document.getElementById("add").onsubmit = async (e) => {
+    e.preventDefault();
+    const name = document.getElementById("name").value.trim();
+    if (!name) return;
+    await joebro.call("plant_add", {plant: name, every_days: Number(document.getElementById("every").value) || 7});
+    document.getElementById("name").value = "";
+    render();
+  };
+  render().catch(e => { sub.textContent = "Couldn't reach the plugin: " + e; });
+</script>
+</body></html>

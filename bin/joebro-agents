@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""joebro-agents: link your coding agents to JoeBro, and build JoeBro plugins.
+
+One stdlib-only file (Python 3.9+) that is, depending on how it is called:
+
+  joebro-agents link <url> --token-file F     point this computer at your JoeBro backend
+  joebro-agents status                        is it linked, is JoeBro reachable
+  joebro-agents install [--claude --codex --opencode]   add the hooks to your agents
+  joebro-agents report <claude|codex|opencode>          (hook) report one event, hand over queued messages
+  joebro-agents mcp                           MCP server: drive coding agents + build plugins
+  joebro-agents ping "message" [--title T]    ping your phone through JoeBro
+  joebro-agents agents                        list the coding agents JoeBro can see
+  joebro-agents plugin init|push|list|spec|source|test|rollback ...
+
+Aliases by file name (symlinks): joebro-agent-report = report, joebro-agents-mcp = mcp,
+joebro-plugin = plugin, joebro-ping = ping.
+
+Config: ~/.config/joebro/agents.json {"url","token","host"} (mode 0600), or env
+JOEBRO_URL / JOEBRO_TOKEN / JOEBRO_HOST. Hooks never block an agent and never
+print unless they are handing over a message.
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "1.0.0"
+HOME = os.path.expanduser("~")
+CONFIG = os.path.join(HOME, ".config", "joebro", "agents.json")
+LEGACY_CONFIG = os.path.join(HOME, ".config", "joebro", "agent-report.json")
+DEFAULT_URL = "http://127.0.0.1:8771"
+
+
+# ----------------------------------------------------------------------------- config / http
+def default_host():
+    name = (socket.gethostname() or "computer").split(".")[0].lower()
+    return re.sub(r"[^a-z0-9-]", "-", name)[:30].strip("-") or "computer"
+
+
+def config():
+    cfg = {}
+    for path in (CONFIG, LEGACY_CONFIG):
+        try:
+            with open(path) as f:
+                cfg = json.load(f)
+            break
+        except (OSError, ValueError):
+            continue
+    url = os.environ.get("JOEBRO_URL") or cfg.get("url") or DEFAULT_URL
+    token = os.environ.get("JOEBRO_TOKEN") or cfg.get("token") or ""
+    host = os.environ.get("JOEBRO_HOST") or cfg.get("host") or default_host()
+    return {"url": url.rstrip("/"), "token": token, "host": host, "linked": bool(cfg) or bool(os.environ.get("JOEBRO_URL"))}
+
+
+def api(method, path, body=None, timeout=60, cfg=None):
+    cfg = cfg or config()
+    headers = {"Content-Type": "application/json"}
+    if cfg["token"]:
+        headers["Authorization"] = "Bearer " + cfg["token"]
+    req = urllib.request.Request(cfg["url"] + path, method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        return json.loads(urllib.request.urlopen(req, timeout=timeout).read() or b"{}")
+    except urllib.error.HTTPError as e:
+        try:
+            detail = json.loads(e.read()).get("detail")
+        except Exception:
+            detail = None
+        return {"ok": False, "error": detail or "HTTP %d" % e.code}
+    except Exception as e:
+        return {"ok": False, "error": "JoeBro is not reachable at %s (%s)" % (cfg["url"], e)}
+
+
+def q(s):
+    return urllib.parse.quote(str(s), safe=":")
+
+
+def clip(v, n=200):
+    return re.sub(r"\s+", " ", str(v or "")).strip()[:n]
+
+
+def detect_harness():
+    env = os.environ
+    if env.get("CLAUDECODE") or env.get("CLAUDE_CODE_ENTRYPOINT"):
+        return "claude"
+    if any(k.startswith("CODEX_") for k in env):
+        return "codex"
+    if env.get("OPENCODE") or any(k.startswith("OPENCODE_") for k in env):
+        return "opencode"
+    return "agent"
+
+
+# ----------------------------------------------------------------------------- hook reporter
+CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool",
+              "PermissionRequest": "waiting", "Stop": "stop", "SessionEnd": "end"}
+
+
+def tool_text(inp):
+    if not isinstance(inp, dict):
+        return clip(inp, 120)
+    for k in ("description", "command", "file_path", "filePath", "path", "pattern", "url", "query", "prompt"):
+        if inp.get(k):
+            v = str(inp[k])
+            if k in ("file_path", "filePath", "path"):
+                v = os.path.basename(v.rstrip("/")) or v
+            return clip(v, 120)
+    return ""
+
+
+def normalise(source, data):
+    if source in ("claude", "codex"):
+        name = data.get("hook_event_name") or data.get("event") or ""
+        ev = CLAUDE_MAP.get(name)
+        if name == "Notification":
+            msg = str(data.get("message") or "")
+            ev = "waiting" if "permission" in msg.lower() or "approv" in msg.lower() else None
+        if not ev:
+            return None
+        out = {"event": ev, "session_id": data.get("session_id") or data.get("thread_id") or "",
+               "cwd": data.get("cwd") or os.getcwd(), "model": data.get("model") or ""}
+        if ev == "prompt":
+            out["text"] = clip(data.get("prompt"), 200)
+        elif ev == "tool":
+            out["tool"] = clip(data.get("tool_name"), 60)
+            out["text"] = tool_text(data.get("tool_input"))
+        elif ev == "waiting":
+            out["text"] = clip(data.get("message") or ("approve " + str(data.get("tool_name") or "")), 160)
+        elif ev == "stop":
+            out["text"] = clip(data.get("last_assistant_message"), 200)
+        return out
+    if source == "opencode":   # the opencode plugin already normalises
+        return data if data.get("event") else None
+    return None
+
+
+def pull(cfg, host, source, sid, via):
+    """Queued instructions for this agent (fast; never holds a turn for long)."""
+    qs = urllib.parse.urlencode({"host": host, "source": source, "session_id": sid, "via": via})
+    try:
+        req = urllib.request.Request(cfg["url"] + "/api/coding-agents/inbox?" + qs,
+                                     headers={"Authorization": "Bearer " + cfg["token"]} if cfg["token"] else {})
+        return json.loads(urllib.request.urlopen(req, timeout=1.5).read()).get("messages") or []
+    except Exception:
+        return []
+
+
+def handover_text(msgs):
+    return "\n\n".join(("Message from JoeBro: %s" % m.get("text")) if (m.get("from") or "joebro").lower() == "joebro"
+                       else "Message from %s via JoeBro: %s" % (m.get("from"), m.get("text")) for m in msgs)
+
+
+def cmd_report(source):
+    cfg = config()
+    if not cfg["linked"]:
+        return 0                     # not linked: do nothing at all
+    try:
+        raw = sys.stdin.read() if not sys.stdin.isatty() else ""
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        return 0
+    ev = normalise(source, data) if isinstance(data, dict) else None
+    if not ev or not ev.get("session_id"):
+        return 0
+    ev.update(source=source, host=cfg["host"])
+    # Command channel: instructions queued for THIS agent are handed over here.
+    # Stop -> Claude/Codex carry on with them (decision:block + reason); prompt -> extra context.
+    if source in ("claude", "codex") and ev["event"] in ("stop", "prompt"):
+        msgs = pull(cfg, cfg["host"], source, ev["session_id"], "stop_hook" if ev["event"] == "stop" else "prompt_hook")
+        if msgs:
+            text = handover_text(msgs)
+            if ev["event"] == "stop":
+                sys.stdout.write(json.dumps({"decision": "block", "reason": text}))
+                ev.update(event="prompt", text=clip(text, 200))
+            else:
+                sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
+            sys.stdout.flush()
+    ev.setdefault("pid", os.getppid())
+    for env, key in (("KITTY_WINDOW_ID", "kitty_window_id"), ("KITTY_LISTEN_ON", "kitty_listen_on"),
+                     ("TMUX_PANE", "tmux_pane"), ("TERM_PROGRAM", "term")):
+        if os.environ.get(env) and not ev.get(key):
+            ev[key] = os.environ[env]
+    try:                               # detach: the harness never waits on the network
+        if os.fork():
+            return 0
+        os.setsid()
+        if os.fork():
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
+    except (OSError, AttributeError):
+        pass
+    api("POST", "/api/coding-agents/event", ev, timeout=4, cfg=cfg)
+    os._exit(0)
+
+
+def cmd_pull(argv):
+    cfg = config()
+    if len(argv) < 2 or not cfg["linked"]:
+        sys.stdout.write("[]")
+        return 0
+    sys.stdout.write(json.dumps(pull(cfg, cfg["host"], argv[0], argv[1], "plugin")))
+    return 0
+
+
+# ----------------------------------------------------------------------------- tools (shared by MCP + CLI)
+def slim(n):
+    term = n.get("terminal") or {}
+    return {"id": n["id"], "harness": n["source"], "host": n["host"], "project": n["name"], "cwd": n["cwd"],
+            "status": n["status"], "needs_you": n.get("waiting", False), "tool_calls": n.get("tool_calls", 0),
+            "last": (n.get("detail") or [""])[-1], "in_terminal": bool(term.get("kitty_window_id") or term.get("tmux_pane")),
+            "last_activity": n.get("last_activity")}
+
+
+def t_list(a):
+    d = api("GET", "/api/coding-agents")
+    if d.get("ok") is False:
+        return d
+    nodes = [slim(n) for n in d.get("nodes", [])]
+    if a.get("harness"):
+        nodes = [n for n in nodes if n["harness"] == a["harness"]]
+    if a.get("host"):
+        nodes = [n for n in nodes if n["host"] == a["host"]]
+    return {"agents": nodes, "count": len(nodes), "busy": sum(n["status"] in ("running", "waiting") for n in nodes)}
+
+
+def t_detail(a):
+    d = api("GET", "/api/agents/" + q(a["id"]))
+    return d.get("agent") or d
+
+
+def t_screen(a):
+    return api("GET", "/api/coding-agents/%s/screen?lines=%d" % (q(a["id"]), int(a.get("lines") or 60)))
+
+
+def t_send(a):
+    return api("POST", "/api/coding-agents/%s/send" % q(a["id"]),
+               {"text": a["text"], "mode": a.get("mode") or "auto", "sender": a.get("sender") or "JoeBro"})
+
+
+KEYS = {"approve": "y", "deny": "n", "interrupt": "escape", "force_stop": "ctrl+c", "enter": "enter",
+        "option_1": "1", "option_2": "2", "option_3": "3", "up": "up", "down": "down", "cycle_mode": "shift+tab"}
+
+
+def t_control(a):
+    key = KEYS.get(a.get("action"))
+    if not key:
+        return {"ok": False, "error": "action must be one of " + ", ".join(KEYS)}
+    return api("POST", "/api/coding-agents/%s/keys" % q(a["id"]), {"keys": key})
+
+
+def t_launch(a):
+    return api("POST", "/api/coding-agents/launch", {"host": a["host"], "harness": a["harness"],
+                                                     "cwd": a.get("cwd") or "", "prompt": a.get("prompt") or ""}, timeout=90)
+
+
+def t_wait(a):
+    deadline = time.time() + max(5, min(int(a.get("timeout_s") or 300), 600))
+    last = None
+    while time.time() < deadline:
+        d = api("GET", "/api/coding-agents")
+        n = next((x for x in d.get("nodes", []) if x["id"] == a["id"]), None)
+        if n is None:
+            return {"id": a["id"], "status": "ended", "detail": "The agent's terminal closed."}
+        last = slim(n)
+        if n["status"] != "running":
+            return dict(last, detail=n.get("detail", [])[-6:])
+        time.sleep(5)
+    return dict(last or {}, timed_out=True)
+
+
+def t_ping(a):
+    cfg = config()
+    return api("POST", "/api/coding-agents/ping", {
+        "message": a.get("message") or "", "title": a.get("title") or "", "source": a.get("source") or detect_harness(),
+        "host": cfg["host"], "cwd": os.getcwd(), "session_id": a.get("session_id") or ""}, timeout=20, cfg=cfg)
+
+
+SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
+
+
+def read_plugin_dir(path):
+    base = os.path.realpath(os.path.expanduser(path))
+    if not os.path.isfile(os.path.join(base, "joebro-plugin.json")):
+        raise ValueError("no joebro-plugin.json in %s" % base)
+    files = {}
+    for root, dirs, names in os.walk(base):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+        for n in names:
+            if n.startswith(".") or n.endswith(".pyc"):
+                continue
+            full = os.path.join(root, n)
+            try:
+                with open(full, encoding="utf-8") as f:
+                    files[os.path.relpath(full, base)] = f.read()
+            except UnicodeDecodeError:
+                raise ValueError("%s is not text: plugins hold text files only (inline small images as SVG or data: URIs)" % full)
+    return files
+
+
+def t_plugin_spec(a):
+    return api("GET", "/api/plugins/spec")
+
+
+def t_plugin_list(a):
+    d = api("GET", "/api/plugins")
+    if d.get("ok") is False:
+        return d
+    keys = ("id", "slug", "name", "version", "is_enabled", "managed", "permission_mode", "contributes", "error", "description")
+    return {"plugins": [{k: p.get(k) for k in keys} for p in d.get("plugins", [])]}
+
+
+def t_plugin_install(a):
+    if a.get("path"):
+        try:
+            files = read_plugin_dir(a["path"])
+        except (OSError, ValueError) as e:
+            return {"ok": False, "error": str(e)}
+    elif isinstance(a.get("files"), dict):
+        files = a["files"]
+    else:
+        return {"ok": False, "error": "give path (a local plugin folder) or files {relative path: text}"}
+    body = {"files": files}
+    if "enable" in a:
+        body["enable"] = bool(a["enable"])
+    return api("POST", "/api/plugins/install", body, timeout=90)
+
+
+def t_plugin_source(a):
+    return api("GET", "/api/plugins/%s/source" % q(a["id"]))
+
+
+def t_plugin_test(a):
+    return api("POST", "/api/plugins/%s/call" % q(a["id"]), {"tool": a["tool"], "arguments": a.get("arguments") or {}}, timeout=60)
+
+
+def t_plugin_rollback(a):
+    return api("POST", "/api/plugins/%s/rollback" % q(a["id"]), {})
+
+
+# ----------------------------------------------------------------------------- MCP server
+S = {"type": "string"}
+ID = {"id": dict(S, description="agent id from coding_agents_list, e.g. code:mac:claude:<uuid>")}
+PID = {"id": dict(S, description="plugin slug (e.g. plant-care) or id (plugin_plant_care)")}
+
+
+def tool(name, desc, props, required=(), read=False, fn=None, destructive=False):
+    return {"name": name, "description": desc, "fn": fn,
+            "inputSchema": {"type": "object", "properties": props, "required": list(required), "additionalProperties": False},
+            "annotations": {"readOnlyHint": read, "destructiveHint": destructive, "openWorldHint": True}}
+
+
+TOOLS = [
+    tool("joebro_ping", "Ping the user's phone through JoeBro: when you finish something long, are blocked on them, or hit something they must know now. One short sentence; don't ping for routine progress (rate limited: one a minute).",
+         {"message": S, "title": dict(S, description="optional short title; defaults to which agent/project you are")}, ["message"], fn=t_ping),
+    tool("coding_agents_list", "List the coding agents JoeBro can see (Claude Code, Codex, opencode...): status running/waiting(needs approval)/idle, project, last action. Start here.",
+         {"harness": {"type": "string", "enum": ["claude", "codex", "opencode", "agy"]}, "host": S}, read=True, fn=t_list),
+    tool("coding_agent_detail", "One agent's recent activity lines (prompts, tool calls, results).", ID, ["id"], read=True, fn=t_detail),
+    tool("coding_agent_screen", "Read the agent's live terminal screen (needs terminal control on that computer); falls back to hook activity.",
+         dict(ID, lines={"type": "integer", "minimum": 10, "maximum": 300}), ["id"], read=True, fn=t_screen),
+    tool("coding_agent_send", "Give a coding agent an instruction. Idle agents in a controllable terminal get it typed in; otherwise it is queued and the agent's own hook hands it over the moment its turn ends. mode: auto, terminal, queue.",
+         dict(ID, text=S, mode={"type": "string", "enum": ["auto", "terminal", "queue"]}, sender=S), ["id", "text"], fn=t_send),
+    tool("coding_agent_control", "Press a key in the agent's terminal: approve / deny a permission prompt, interrupt (Esc), force_stop (Ctrl-C), enter, option_1..3, up/down, cycle_mode. Read the screen first.",
+         dict(ID, action={"type": "string", "enum": list(KEYS)}), ["id", "action"], fn=t_control, destructive=True),
+    tool("coding_agent_launch", "Open a new coding agent in a terminal on a linked computer (needs terminal control there), optionally in a folder with a first prompt.",
+         {"host": S, "harness": {"type": "string", "enum": ["claude", "codex", "opencode", "agy"]}, "cwd": S, "prompt": S}, ["host", "harness"], fn=t_launch),
+    tool("coding_agent_wait", "Wait until an agent finishes its turn or needs approval (max 10 min). Returns its final lines.",
+         dict(ID, timeout_s={"type": "integer", "minimum": 5, "maximum": 600}), ["id"], read=True, fn=t_wait),
+    tool("joebro_plugin_spec", "The JoeBro plugin standard (joebro.plugin/1): manifest, python tools, UI panels with the joebro.call bridge, install rules. Read it before building or editing a JoeBro plugin.", {}, read=True, fn=t_plugin_spec),
+    tool("joebro_plugin_list", "List JoeBro plugins (built-in and custom): on/off, version, what each contributes (tools, guardrail, panels), errors.", {}, read=True, fn=t_plugin_list),
+    tool("joebro_plugin_install", "Install or update a JoeBro plugin from a local folder (path) or a files map. Validated, staged and swapped atomically; the previous version is kept. New plugins start OFF unless enable=true (only when the user asked for it). Lists every validation problem at once.",
+         {"path": dict(S, description="local folder containing joebro-plugin.json"),
+          "files": {"type": "object", "description": "instead of path: {relative path: file text}", "additionalProperties": {"type": "string"}},
+          "enable": {"type": "boolean"}}, fn=t_plugin_install),
+    tool("joebro_plugin_source", "Read an installed plugin's files, to edit or extend it.", PID, ["id"], read=True, fn=t_plugin_source),
+    tool("joebro_plugin_test", "Call one of a plugin's tools for real (the plugin must be on) to check it works.",
+         dict(PID, tool=S, arguments={"type": "object"}), ["id", "tool"], fn=t_plugin_test),
+    tool("joebro_plugin_rollback", "Swap a plugin back to its previous installed version.", PID, ["id"], fn=t_plugin_rollback),
+]
+BY_NAME = {t["name"]: t for t in TOOLS}
+
+
+def cmd_mcp():
+    for line in sys.stdin:
+        try:
+            req = json.loads(line)
+        except ValueError:
+            continue
+        if "id" not in req:
+            continue
+        method, params = req.get("method"), req.get("params") or {}
+        try:
+            if method == "initialize":
+                result = {"protocolVersion": params.get("protocolVersion", "2024-11-05"), "capabilities": {"tools": {}},
+                          "serverInfo": {"name": "joebro", "version": VERSION}}
+            elif method == "ping":
+                result = {}
+            elif method == "tools/list":
+                result = {"tools": [{k: v for k, v in t.items() if k != "fn"} for t in TOOLS]}
+            elif method == "tools/call":
+                t = BY_NAME.get(params.get("name"))
+                if not t:
+                    raise ValueError("unknown tool")
+                data = t["fn"](params.get("arguments") or {})
+                result = {"content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False)}],
+                          "isError": isinstance(data, dict) and data.get("ok") is False}
+            else:
+                raise ValueError("method not found")
+            out = {"jsonrpc": "2.0", "id": req["id"], "result": result}
+        except Exception as e:
+            out = {"jsonrpc": "2.0", "id": req["id"],
+                   "error": {"code": -32601 if str(e) == "method not found" else -32000, "message": str(e)}}
+        sys.stdout.write(json.dumps(out) + "\n")
+        sys.stdout.flush()
+    return 0
+
+
+# ----------------------------------------------------------------------------- plugin CLI
+TEMPLATE_TOOLS = '''"""Tools for the %(name)s plugin: one function per tool declared in joebro-plugin.json."""
+import json
+import os
+
+DATA = os.path.join(os.environ.get("JOEBRO_PLUGIN_DATA", "."), "state.json")
+
+
+def _load():
+    try:
+        with open(DATA) as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def hello(name="there"):
+    state = _load()
+    state["count"] = state.get("count", 0) + 1
+    with open(DATA, "w") as f:
+        json.dump(state, f)
+    return {"greeting": "Hello %%s" %% name, "times": state["count"]}
+'''
+
+TEMPLATE_UI = '''<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width">
+<style>
+  :root { color-scheme: light dark; font: 13px -apple-system, system-ui, sans-serif; }
+  body { margin: 16px; background: transparent; }
+  button { font: inherit; padding: 6px 12px; border-radius: 8px; }
+</style></head>
+<body>
+  <h2>%(name)s</h2>
+  <button id="go">Say hello</button>
+  <pre id="out"></pre>
+  <script>
+    document.getElementById("go").onclick = async () => {
+      const r = await joebro.call("hello", {name: "you"});
+      document.getElementById("out").textContent = JSON.stringify(r, null, 2);
+    };
+  </script>
+</body></html>
+'''
+
+
+def show(r):
+    print(json.dumps(r, indent=2, ensure_ascii=False))
+    return 0 if not (isinstance(r, dict) and r.get("ok") is False) else 1
+
+
+def cmd_plugin(argv):
+    """joebro-agents plugin init <id> [dir] | push <dir> [--enable] | list | spec | source <id> <dir> | test <id> <tool> [json] | rollback <id>"""
+    cmd = argv[0] if argv else "help"
+    if cmd == "init" and len(argv) >= 2:
+        pid = argv[1]
+        if not re.match(r"^[a-z][a-z0-9-]{1,39}$", pid):
+            sys.exit("plugin id: lowercase letters, digits and dashes, 2-40 chars, starting with a letter")
+        d = os.path.abspath(argv[2] if len(argv) > 2 else pid)
+        if os.path.exists(os.path.join(d, "joebro-plugin.json")):
+            sys.exit("%s already has a joebro-plugin.json" % d)
+        os.makedirs(os.path.join(d, "ui"), exist_ok=True)
+        name = pid.replace("-", " ").title()
+        manifest = {"schema": "joebro.plugin/1", "id": pid, "name": name, "version": "0.1.0",
+                    "description": "Describe what %s does." % name, "permission": "sandbox",
+                    "runtime": {"type": "python", "entry": "tools.py"},
+                    "contributes": {"tools": [{"name": "hello", "description": "Say hello (example tool, replace it). Use when the user greets the plugin.",
+                                               "parameters": {"type": "object", "properties": {"name": {"type": "string"}}}}],
+                                    "panels": [{"id": "main", "title": name, "icon": "puzzlepiece.extension", "entry": "ui/index.html"}]}}
+        with open(os.path.join(d, "joebro-plugin.json"), "w") as f:
+            f.write(json.dumps(manifest, indent=2) + "\n")
+        with open(os.path.join(d, "tools.py"), "w") as f:
+            f.write(TEMPLATE_TOOLS % {"name": name})
+        with open(os.path.join(d, "ui", "index.html"), "w") as f:
+            f.write(TEMPLATE_UI % {"name": name})
+        print("Created %s\nEdit it, then: joebro-plugin push %s" % (d, d))
+        return 0
+    if cmd == "push" and len(argv) >= 2:
+        a = {"path": argv[1]}
+        if "--enable" in argv:
+            a["enable"] = True
+        return show(t_plugin_install(a))
+    if cmd == "list":
+        return show(t_plugin_list({}))
+    if cmd == "spec":
+        r = t_plugin_spec({})
+        print(r.get("spec") or json.dumps(r))
+        return 0
+    if cmd == "source" and len(argv) >= 3:
+        r = t_plugin_source({"id": argv[1]})
+        for rel, text in (r.get("files") or {}).items():
+            path = os.path.join(argv[2], rel)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+        return show({"ok": r.get("ok", False), "written": sorted(r.get("files") or {}), "error": r.get("detail") or r.get("error")})
+    if cmd == "test" and len(argv) >= 3:
+        return show(t_plugin_test({"id": argv[1], "tool": argv[2], "arguments": json.loads(argv[3]) if len(argv) > 3 else {}}))
+    if cmd == "rollback" and len(argv) >= 2:
+        return show(t_plugin_rollback({"id": argv[1]}))
+    print(cmd_plugin.__doc__)
+    return 2
+
+
+# ----------------------------------------------------------------------------- link / status / install
+def cmd_link(argv):
+    if not argv or argv[0].startswith("-"):
+        sys.exit("usage: joebro-agents link <url> [--token TOKEN | --token-file FILE] [--host NAME]")
+    url, token, host = argv[0].rstrip("/"), "", default_host()
+    i = 1
+    while i < len(argv):
+        if argv[i] == "--token" and i + 1 < len(argv):
+            token = argv[i + 1]; i += 2
+        elif argv[i] == "--token-file" and i + 1 < len(argv):
+            with open(os.path.expanduser(argv[i + 1])) as f:
+                token = f.read().strip()
+            i += 2
+        elif argv[i] == "--host" and i + 1 < len(argv):
+            host = argv[i + 1]; i += 2
+        else:
+            sys.exit("unknown option " + argv[i])
+    cfg = {"url": url, "token": token, "host": host, "linked": True}
+    r = api("GET", "/api/plugins", cfg=cfg, timeout=10)
+    if r.get("ok") is False:
+        sys.exit("Could not reach JoeBro: %s" % r.get("error"))
+    os.makedirs(os.path.dirname(CONFIG), exist_ok=True)
+    tmp = CONFIG + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"url": url, "token": token, "host": host}, f, indent=2)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, CONFIG)
+    print("Linked %s to JoeBro at %s. Next: joebro-agents install" % (host, url))
+    return 0
+
+
+def cmd_status():
+    cfg = config()
+    print("joebro-agents %s\nconfig: %s\nurl:    %s\nhost:   %s\ntoken:  %s" % (
+        VERSION, CONFIG if os.path.exists(CONFIG) else (LEGACY_CONFIG if os.path.exists(LEGACY_CONFIG) else "(not linked)"),
+        cfg["url"], cfg["host"], "set" if cfg["token"] else "none"))
+    r = api("GET", "/api/coding-agents", timeout=8)
+    if r.get("ok") is False:
+        print("backend: " + r.get("error", "unreachable"))
+        return 1
+    print("backend: reachable, %d coding agent(s) visible" % len(r.get("nodes") or []))
+    return 0
+
+
+CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Notification", "Stop", "SessionEnd"]
+CODEX_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop"]
+MARK = "joebro"
+
+
+def _ours(group):
+    return any(re.search(r"(^|/)joebro-agent(s|-report)( |$)", str(h.get("command", ""))) for h in group.get("hooks", []))
+
+
+def _merge(path, events, source, remove=False):
+    data = {}
+    if os.path.exists(path):
+        with open(path) as f:
+            data = json.load(f)
+        if not os.path.exists(path + ".before-joebro"):
+            shutil.copy2(path, path + ".before-joebro")
+    hooks = data.get("hooks") or {}
+    hooks = {k: [g for g in v if not _ours(g)] for k, v in hooks.items()}
+    if not remove:
+        cmd = os.path.join(HOME, ".local", "bin", "joebro-agents") + " report " + source
+        for ev in events:
+            hooks.setdefault(ev, []).append({"hooks": [{"type": "command", "command": cmd, "timeout": 5}]})
+    data["hooks"] = {k: v for k, v in hooks.items() if v}
+    tmp = path + ".tmp-joebro"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_install(argv):
+    """joebro-agents install [--claude] [--codex] [--opencode] [--uninstall]   (no flags = every agent found)"""
+    remove = "--uninstall" in argv
+    want = {a.lstrip("-") for a in argv if a in ("--claude", "--codex", "--opencode")} or {"claude", "codex", "opencode"}
+    bindir = os.path.join(HOME, ".local", "bin")
+    me = os.path.realpath(__file__)
+    if not remove:
+        os.makedirs(bindir, exist_ok=True)
+        dst = os.path.join(bindir, "joebro-agents")
+        if os.path.realpath(dst) != me:
+            shutil.copy2(me, dst)
+        os.chmod(dst, os.stat(dst).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        for alias in ("joebro-ping", "joebro-plugin", "joebro-agents-mcp", "joebro-agent-report"):
+            p = os.path.join(bindir, alias)
+            if os.path.islink(p) or not os.path.exists(p):
+                if os.path.islink(p):
+                    os.remove(p)
+                os.symlink("joebro-agents", p)
+        print("installed %s (+ joebro-ping, joebro-plugin, joebro-agents-mcp, joebro-agent-report)" % dst)
+    if "claude" in want and os.path.isdir(os.path.join(HOME, ".claude")):
+        _merge(os.path.join(HOME, ".claude", "settings.json"), CLAUDE_EVENTS, "claude", remove)
+        print("Claude Code: hooks %s" % ("removed" if remove else "added (MCP: claude mcp add joebro -- joebro-agents mcp)"))
+    if "codex" in want and os.path.isdir(os.path.join(HOME, ".codex")):
+        _merge(os.path.join(HOME, ".codex", "hooks.json"), CODEX_EVENTS, "codex", remove)
+        print("Codex: hooks %s" % ("removed" if remove else "added; Codex asks once to trust them"))
+    if "opencode" in want and os.path.isdir(os.path.join(HOME, ".config", "opencode")):
+        src = os.path.join(os.path.dirname(os.path.dirname(me)), "opencode", "joebro.js")
+        d = os.path.join(HOME, ".config", "opencode", "plugins")
+        dst = os.path.join(d, "joebro.js")
+        if remove:
+            if os.path.exists(dst):
+                os.remove(dst)
+            print("opencode: plugin removed")
+        elif os.path.exists(src):
+            os.makedirs(d, exist_ok=True)
+            shutil.copy2(src, dst)
+            print("opencode: plugin added -> " + dst)
+        else:
+            print("opencode: copy opencode/joebro.js from the joebro-plugins repo into " + d)
+    return 0
+
+
+def cmd_ping(argv):
+    title, words, i = "", [], 0
+    while i < len(argv):
+        if argv[i] == "--title" and i + 1 < len(argv):
+            title = argv[i + 1]; i += 2
+        else:
+            words.append(argv[i]); i += 1
+    msg = " ".join(words).strip() or (sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    if not msg:
+        sys.exit('usage: joebro-ping "message" [--title T]')
+    r = t_ping({"message": msg, "title": title})
+    if r.get("ok") is False:
+        print(r.get("detail") or r.get("error"), file=sys.stderr)
+        return 1
+    print("Pinged: " + r.get("title", ""))
+    return 0
+
+
+def main():
+    prog = os.path.basename(sys.argv[0])
+    argv = sys.argv[1:]
+    if prog == "joebro-agent-report":
+        return cmd_pull(argv[1:]) if argv[:1] == ["pull"] else cmd_report((argv[0] if argv else "").lower())
+    if prog in ("joebro-agents-mcp", "joebro_agents_mcp.py"):
+        return cmd_mcp() if not argv or argv[0] != "plugin" else cmd_plugin(argv[1:])
+    if prog == "joebro-plugin":
+        return cmd_plugin(argv)
+    if prog == "joebro-ping":
+        return cmd_ping(argv)
+    cmd, rest = (argv[0] if argv else "help"), argv[1:]
+    if cmd == "report":
+        return cmd_report((rest[0] if rest else "").lower())
+    if cmd == "pull":
+        return cmd_pull(rest)
+    if cmd == "mcp":
+        return cmd_mcp()
+    if cmd == "plugin":
+        return cmd_plugin(rest)
+    if cmd == "ping":
+        return cmd_ping(rest)
+    if cmd == "agents":
+        return show(t_list({}))
+    if cmd == "link":
+        return cmd_link(rest)
+    if cmd == "status":
+        return cmd_status()
+    if cmd == "install":
+        return cmd_install(rest)
+    if cmd in ("--version", "version"):
+        print(VERSION)
+        return 0
+    print(__doc__)
+    return 0 if cmd in ("help", "-h", "--help") else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

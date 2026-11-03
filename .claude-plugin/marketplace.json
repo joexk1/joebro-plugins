@@ -1,0 +1,16 @@
+{
+  "name": "joebro",
+  "owner": {
+    "name": "joexk1"
+  },
+  "metadata": {
+    "description": "Link your coding agents to JoeBro and build JoeBro plugins."
+  },
+  "plugins": [
+    {
+      "name": "joebro",
+      "source": "./claude-code",
+      "description": "Claude Code sessions in the JoeBro app, messages from JoeBro, phone pings and the plugin builder (MCP)."
+    }
+  ]
+}
