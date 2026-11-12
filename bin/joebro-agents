@@ -10,6 +10,9 @@ One stdlib-only file (Python 3.9+) that is, depending on how it is called:
   joebro-agents mcp                           MCP server: drive coding agents + build plugins
   joebro-agents ping "message" [--title T]    ping your phone through JoeBro
   joebro-agents agents                        list the coding agents JoeBro can see
+  joebro-agents brief                         this repo's Shared Memory brief (what a session starts with)
+  joebro-agents memory import [--write] [--global]   move CLAUDE.md / AGENTS.md / agent memory into Shared Memory
+  joebro-agents memory mirror                 write .joebro/memory/MEMORY.md for this repo
   joebro-agents plugin init|push|list|spec|source|test|rollback ...
 
 Aliases by file name (symlinks): joebro-agent-report = report, joebro-agents-mcp = mcp,
@@ -181,6 +184,15 @@ def cmd_report(source):
             else:
                 sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
             sys.stdout.flush()
+    if source in ("claude", "codex") and ev["event"] == "start" and memory_on(cfg):
+        text = brief_text(ev.get("cwd") or os.getcwd(), cfg, timeout=1.5)     # once per session, <= 400 tokens
+        if text:
+            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+            sys.stdout.flush()
+    if ev["event"] in ("stop", "end") and not ev.get("branch"):
+        ev["branch"] = _git(ev.get("cwd") or os.getcwd(), "symbolic-ref", "--short", "-q", "HEAD")
+    if os.environ.get("JOEBRO_NIGHT_TASK"):
+        ev["night_task"] = os.environ["JOEBRO_NIGHT_TASK"]
     ev.setdefault("pid", os.getppid())
     for env, key in (("KITTY_WINDOW_ID", "kitty_window_id"), ("KITTY_LISTEN_ON", "kitty_listen_on"),
                      ("TMUX_PANE", "tmux_pane"), ("TERM_PROGRAM", "term")):
@@ -207,6 +219,206 @@ def cmd_pull(argv):
         sys.stdout.write("[]")
         return 0
     sys.stdout.write(json.dumps(pull(cfg, cfg["host"], argv[0], argv[1], "plugin")))
+    return 0
+
+
+# ----------------------------------------------------------------------------- shared memory + night shift
+def _git(cwd, *args):
+    try:
+        import subprocess
+        p = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=3)
+        return p.stdout.strip() if p.returncode == 0 else ""
+    except Exception:
+        return ""
+
+
+def project_ctx(cwd=None):
+    """Which project this is: the main checkout's path and its origin remote (worktrees share their repo's memory)."""
+    cwd = cwd or os.getcwd()
+    top = _git(cwd, "rev-parse", "--show-toplevel") or cwd
+    common = _git(cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common.endswith("/.git"):
+        top = common[:-5]
+    return {"path": top, "remote": _git(cwd, "remote", "get-url", "origin"), "project_name": os.path.basename(top.rstrip("/"))}
+
+
+def memory_on(cfg=None):
+    return os.environ.get("JOEBRO_MEMORY", "").lower() not in ("off", "0", "false")
+
+
+def provenance(cfg=None):
+    cfg = cfg or config()
+    return {"agent": detect_harness(), "host": cfg["host"], "source": "mcp",
+            "model": os.environ.get("JOEBRO_MODEL") or os.environ.get("ANTHROPIC_MODEL") or "",
+            "session": os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("JOEBRO_NIGHT_TASK") or ""}
+
+
+def brief_text(cwd=None, cfg=None, timeout=4):
+    d = api("GET", "/api/shared-memory/brief?" + urllib.parse.urlencode(project_ctx(cwd)), timeout=timeout, cfg=cfg)
+    return d.get("brief") or ""
+
+
+def _fact(f):
+    """A fact as an agent sees it: compact on purpose."""
+    return {"id": f.get("id"), "text": f.get("text"), "topic": f.get("topic"), "strength": f.get("strength"),
+            **({"status": f["status"]} if f.get("status") not in (None, "active") else {}),
+            **({"scope": "global"} if f.get("scope") == "global" else {})}
+
+
+def _mem(d, key="fact"):
+    if d.get("ok") is False:
+        return d
+    return {"ok": True, key: _fact(d[key]), **({"outcome": d["outcome"]} if d.get("outcome") else {})}
+
+
+def t_remember(a):
+    body = dict(project_ctx(), **provenance(), text=a.get("text") or "", topic=a.get("topic") or "", kind=a.get("kind") or "fact")
+    if a.get("scope") == "global":
+        body = dict(provenance(), project="global", text=body["text"], topic=body["topic"], kind=body["kind"])
+    return _mem(api("POST", "/api/shared-memory", body))
+
+
+def t_recall(a):
+    d = api("POST", "/api/shared-memory/recall", dict(project_ctx(), query=a.get("query") or "", limit=min(int(a.get("limit") or 5), 10),
+                                                      include_archived=bool(a.get("include_archived"))))
+    return d if d.get("ok") is False else {"facts": [_fact(f) for f in d.get("facts", [])]}
+
+
+def t_supersede(a):
+    return _mem(api("POST", "/api/shared-memory/%s/supersede" % q(a["id"]), dict(provenance(), text=a.get("text") or "", reason=a.get("reason") or "")))
+
+
+def t_forget(a):
+    return _mem(api("POST", "/api/shared-memory/%s/archive" % q(a["id"]), {"reason": a.get("reason") or "", "agent": detect_harness()}))
+
+
+def t_brief(a):
+    d = api("GET", "/api/shared-memory/brief?" + urllib.parse.urlencode(project_ctx()))
+    return d if d.get("ok") is False else {"brief": d.get("brief"), "tokens": d.get("tokens")}
+
+
+def _night(t):
+    return {k: t.get(k) for k in ("id", "title", "status", "repo", "agent", "model", "branch", "error") if t.get(k)}
+
+
+def t_night_add(a):
+    body = {k: a[k] for k in ("prompt", "title", "agent", "model", "test_command", "window_start", "window_end", "max_minutes") if a.get(k)}
+    body["repo"] = a.get("repo") or project_ctx()["path"]
+    d = api("POST", "/api/night-shift", body)
+    return d if d.get("ok") is False else {"ok": True, "task": _night(d["task"])}
+
+
+def t_night_list(a):
+    d = api("GET", "/api/night-shift")
+    return d if d.get("ok") is False else {"tasks": [_night(t) for t in d.get("tasks", [])
+                                                     if t.get("status") in ("queued", "running", "review", "failed")]}
+
+
+def t_night_cancel(a):
+    d = api("POST", "/api/night-shift/%s/cancel" % q(a["id"]), {})
+    return d if d.get("ok") is False else {"ok": True, "task": _night(d["task"])}
+
+
+# The agents' own memory files this replaces. Repo files are rewritten to a pointer on --write.
+REPO_MEMORY_FILES = [("CLAUDE.md", "claude"), ("CLAUDE.local.md", "claude"), (".claude/CLAUDE.md", "claude"),
+                     ("AGENTS.md", "codex"), ("AGENTS.override.md", "codex"), (".opencode/AGENTS.md", "opencode")]
+GLOBAL_MEMORY_FILES = [(".claude/CLAUDE.md", "claude"), (".codex/AGENTS.md", "codex"), (".config/opencode/AGENTS.md", "opencode")]
+POINTER_FILES = ("CLAUDE.md", "AGENTS.md")
+MEM_MARK = "<!-- joebro:memory:start -->"
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except (OSError, UnicodeDecodeError):
+        return ""
+
+
+def memory_sources(top, is_global=False):
+    """[(absolute path, agent, text)] for one repo (or the user-wide files with --global)."""
+    out = []
+    if is_global:
+        cands = [(os.path.join(HOME, rel), agent) for rel, agent in GLOBAL_MEMORY_FILES]
+    else:
+        cands = [(os.path.join(top, rel), agent) for rel, agent in REPO_MEMORY_FILES]
+        try:        # OpenCode rules listed in opencode.json
+            for rel in json.loads(_read(os.path.join(top, "opencode.json")) or "{}").get("instructions") or []:
+                if isinstance(rel, str) and "*" not in rel and "://" not in rel:
+                    cands.append((os.path.join(top, rel), "opencode"))
+        except ValueError:
+            pass
+        mem = os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", top), "memory")   # Claude Code auto-memory
+        if os.path.isdir(mem):
+            cands += [(os.path.join(mem, n), "claude") for n in sorted(os.listdir(mem)) if n.endswith(".md")]
+    seen = set()
+    for path, agent in cands:
+        real = os.path.realpath(path)
+        text = _read(path)
+        if real in seen or not text.strip():
+            continue
+        seen.add(real)
+        if MEM_MARK in text and len(text) < 1200:
+            continue                    # already a pointer
+        out.append((path, agent, text))
+    return out
+
+
+def cmd_memory(argv):
+    cfg = config()
+    sub = argv[0] if argv else ""
+    ctx = project_ctx()
+    top = ctx["path"]
+    if sub == "mirror":
+        d = api("GET", "/api/shared-memory/mirror?" + urllib.parse.urlencode(ctx), cfg=cfg)
+        if d.get("ok") is False:
+            sys.exit(d.get("error") or d.get("detail"))
+        dest = os.path.join(top, ".joebro", "memory")
+        os.makedirs(dest, exist_ok=True)
+        for name, text in d["files"].items():
+            with open(os.path.join(dest, os.path.basename(name)), "w") as f:
+                f.write(text)
+        print("wrote " + dest)
+        return 0
+    if sub != "import":
+        sys.exit("usage: joebro-agents memory import [--write] [--global] | mirror")
+    is_global, write = "--global" in argv, "--write" in argv
+    sources = memory_sources(top, is_global)
+    if not sources:
+        print("No agent memory files found%s." % ("" if is_global else " in " + top))
+        return 0
+    body = dict({"project": "global"} if is_global else ctx, host=cfg["host"], agent="import",
+                files=[{"path": p, "agent": agent, "text": text} for p, agent, text in sources])
+    d = api("POST", "/api/shared-memory/import", body, cfg=cfg)
+    if d.get("ok") is False:
+        sys.exit(d.get("error") or d.get("detail"))
+    print("Imported %d files (%d tokens): %d facts added, %d duplicates merged, %d skipped." % (
+        d["files"], d["tokens_before"], d["added"], d["deduped"] + d["superseded"], d["skipped"]))
+    print("Per session: %d tokens before -> %d after (brief %d + pointer %d)." % (
+        d["tokens_before"], d["tokens_after"], d["brief_tokens"], d["pointer_tokens"]))
+    if is_global or not write:
+        print("Nothing on disk was changed. %s" % ("User-wide files are left as they are; trim them by hand." if is_global else
+                                                   "Run again with --write to replace these files with a short pointer:"))
+        for p, _, _ in sources:
+            print("  " + p)
+        return 0
+    backup = os.path.join(top, ".joebro", "memory", "imported")
+    os.makedirs(backup, exist_ok=True)
+    for p, _, text in sources:          # originals are kept; memory is now the single source of truth
+        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.relpath(p, top) if p.startswith(top) else "claude-memory_" + os.path.basename(p))
+        with open(os.path.join(backup, name), "w") as f:
+            f.write(text)
+        if p.startswith(top + os.sep) and os.path.relpath(p, top) not in POINTER_FILES:
+            os.remove(p)
+        elif not p.startswith(top + os.sep):
+            os.replace(p, p + ".before-joebro")
+    for name in POINTER_FILES:
+        with open(os.path.join(top, name), "w") as f:
+            f.write(d["slim"])
+    for name, text in (api("GET", "/api/shared-memory/mirror?" + urllib.parse.urlencode(ctx), cfg=cfg).get("files") or {}).items():
+        with open(os.path.join(top, ".joebro", "memory", os.path.basename(name)), "w") as f:
+            f.write(text)
+    print("CLAUDE.md and AGENTS.md now point at Shared Memory. Originals: " + backup)
     return 0
 
 
@@ -373,6 +585,23 @@ TOOLS = [
          {"host": S, "harness": {"type": "string", "enum": ["claude", "codex", "opencode", "agy"]}, "cwd": S, "prompt": S}, ["host", "harness"], fn=t_launch),
     tool("coding_agent_wait", "Wait until an agent finishes its turn or needs approval (max 10 min). Returns its final lines.",
          dict(ID, timeout_s={"type": "integer", "minimum": 5, "maximum": 600}), ["id"], read=True, fn=t_wait),
+    tool("memory_recall", "Look up this project's shared memory (one store for every coding agent: decisions, conventions, gotchas, how to run and test). Returns a few short facts. Use it before guessing how this repo does something.",
+         {"query": S, "limit": {"type": "integer", "minimum": 1, "maximum": 10}, "include_archived": {"type": "boolean"}}, ["query"], read=True, fn=t_recall),
+    tool("memory_remember", "Save ONE durable fact about this project for every future agent session: a decision, a convention, a gotcha, or how to run/test something. One sentence. Not progress notes, not task summaries, never secrets. Duplicates are merged for you.",
+         {"text": S, "topic": dict(S, description="one word, e.g. testing, deploy, style"),
+          "kind": {"type": "string", "enum": ["fact", "decision", "convention", "gotcha", "howto"]},
+          "scope": {"type": "string", "enum": ["project", "global"], "description": "global = true for every repo"}}, ["text"], fn=t_remember),
+    tool("memory_supersede", "A remembered fact has changed: replace it with the new wording. The old one is kept as history.",
+         {"id": dict(S, description="fact id from memory_recall"), "text": S, "reason": S}, ["id", "text"], fn=t_supersede),
+    tool("memory_forget", "Archive a remembered fact that is wrong or no longer useful (archived, not deleted).",
+         {"id": S, "reason": S}, ["id"], fn=t_forget),
+    tool("memory_project_brief", "The short memory brief for this project (the same one given at session start).", {}, read=True, fn=t_brief),
+    tool("night_shift_add", "Queue a coding task for JoeBro Night Shift: it runs unattended overnight in its own git worktree and waits for the user's review in the morning. Never pushes.",
+         {"prompt": S, "repo": dict(S, description="repo path; default: this one"), "title": S,
+          "agent": {"type": "string", "enum": ["claude", "codex", "opencode", "any"]}, "model": S, "test_command": S,
+          "window_start": dict(S, description="HH:MM"), "window_end": dict(S, description="HH:MM")}, ["prompt"], fn=t_night_add),
+    tool("night_shift_list", "Night Shift tasks that are queued, running or waiting for review.", {}, read=True, fn=t_night_list),
+    tool("night_shift_cancel", "Cancel a queued Night Shift task (or stop a running one; its worktree is kept).", {"id": S}, ["id"], fn=t_night_cancel),
     tool("joebro_plugin_spec", "The JoeBro plugin standard (joebro.plugin/1): manifest, python tools, UI panels with the joebro.call bridge, install rules. Read it before building or editing a JoeBro plugin.", {}, read=True, fn=t_plugin_spec),
     tool("joebro_plugin_list", "List JoeBro plugins (built-in and custom): on/off, version, what each contributes (tools, guardrail, panels), errors.", {}, read=True, fn=t_plugin_list),
     tool("joebro_plugin_install", "Install or update a JoeBro plugin from a local folder (path) or a files map. Validated, staged and swapped atomically; the previous version is kept. New plugins start OFF unless enable=true (only when the user asked for it). Lists every validation problem at once.",
@@ -599,6 +828,42 @@ def _merge(path, events, source, remove=False):
     os.replace(tmp, path)
 
 
+def _wire_mcp(remove=False):
+    """Register the joebro MCP server (memory, night shift, agents) with Codex and OpenCode."""
+    binary = os.path.join(HOME, ".local", "bin", "joebro-agents")
+    done = []
+    toml = os.path.join(HOME, ".codex", "config.toml")
+    if os.path.isdir(os.path.dirname(toml)):
+        text = _read(toml)
+        block = '\n[mcp_servers.joebro]\ncommand = "%s"\nargs = ["mcp"]\n' % binary
+        if remove and block in text:
+            with open(toml, "w") as f:
+                f.write(text.replace(block, ""))
+        elif not remove and "[mcp_servers.joebro]" not in text:
+            with open(toml, "a") as f:
+                f.write(block)
+            done.append("Codex")
+    oc = os.path.join(HOME, ".config", "opencode", "opencode.json")
+    if os.path.isdir(os.path.dirname(oc)):
+        try:
+            data = json.loads(_read(oc) or "{}")
+        except ValueError:
+            data = None                 # JSONC or broken: leave it alone
+        if isinstance(data, dict):
+            mcp = data.setdefault("mcp", {})
+            changed = bool(mcp.pop("joebro", None)) if remove else "joebro" not in mcp
+            if not remove and changed:
+                mcp["joebro"] = {"type": "local", "command": [binary, "mcp"], "enabled": True}
+                done.append("OpenCode")
+            if changed:
+                if os.path.exists(oc) and not os.path.exists(oc + ".before-joebro"):
+                    shutil.copy2(oc, oc + ".before-joebro")
+                with open(oc, "w") as f:
+                    json.dump(data, f, indent=2)
+                    f.write("\n")
+    return done
+
+
 def cmd_install(argv):
     """joebro-agents install [--claude] [--codex] [--opencode] [--uninstall]   (no flags = every agent found)"""
     remove = "--uninstall" in argv
@@ -638,6 +903,9 @@ def cmd_install(argv):
             print("opencode: plugin added -> " + dst)
         else:
             print("opencode: copy opencode/joebro.js from the joebro-plugins repo into " + d)
+    wired = _wire_mcp(remove)
+    if wired:
+        print("MCP server (shared memory, night shift, agents) added for: " + ", ".join(wired))
     return 0
 
 
@@ -683,6 +951,11 @@ def main():
         return cmd_ping(rest)
     if cmd == "agents":
         return show(t_list({}))
+    if cmd == "brief":
+        print(brief_text() or "(no memory for this project yet)")
+        return 0
+    if cmd == "memory":
+        return cmd_memory(rest)
     if cmd == "link":
         return cmd_link(rest)
     if cmd == "status":

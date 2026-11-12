@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+- Shared Memory: MCP tools `memory_recall`, `memory_remember`, `memory_supersede`, `memory_forget`, `memory_project_brief`; a brief of at most 400 tokens at session start (Claude Code, Codex, OpenCode); `joebro-agents memory import [--write]` moves CLAUDE.md / AGENTS.md / agent memory into the one store and leaves a short pointer.
+- Night Shift: MCP tools `night_shift_add`, `night_shift_list`, `night_shift_cancel`.
+- `joebro-agents install` registers the MCP server with Codex and OpenCode.
+
 ## 1.0.0 (2026-11-03)
 
 - `joebro-agents`: one stdlib Python file that links Claude Code, Codex and opencode to JoeBro (hook reporter), runs the `joebro` MCP server, builds plugins and pings your phone.

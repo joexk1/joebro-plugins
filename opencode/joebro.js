@@ -40,7 +40,19 @@ export const JoeBro = async ({ directory, client }) => {
       child.unref()
     } catch {}
   }
+  // Shared Memory brief (<= 400 tokens), fetched once per plugin instance and added to the system prompt.
+  let brief = null
+  const loadBrief = () => new Promise((resolve) => {
+    if (brief !== null || process.env.JOEBRO_MEMORY === "off") return resolve(brief || "")
+    execFile(JOEBRO, ["brief"], { timeout: 3000, cwd: directory }, (err, out) => {
+      brief = err || /^\(no memory/.test(out || "") ? "" : String(out || "").trim()
+      resolve(brief)
+    })
+  })
   return {
+    "experimental.chat.system.transform": async (_input, output) => {
+      try { const text = await loadBrief(); if (text && Array.isArray(output?.system)) output.system.push(text) } catch {}
+    },
     "chat.message": async (input, output) => {
       const text = (output?.parts ?? []).filter((p) => p?.type === "text").map((p) => p.text).join(" ")
       send({ event: "prompt", session_id: input.sessionID, text: clip(text),

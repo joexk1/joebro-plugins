@@ -36,6 +36,10 @@ class Fake(BaseHTTPRequestHandler):
         if self.path.startswith("/api/coding-agents/inbox"):
             msgs, Fake.inbox[:] = list(Fake.inbox), []
             return self._send({"ok": True, "messages": msgs})
+        if self.path.startswith("/api/shared-memory/brief"):
+            return self._send({"ok": True, "brief": "Shared memory (JoeBro) for proj.\n- [testing] Run tests with make test.", "tokens": 18})
+        if self.path.startswith("/api/shared-memory/mirror"):
+            return self._send({"ok": True, "files": {"MEMORY.md": "# Memory: proj\n- Run tests with make test.\n", "ARCHIVE.md": "# Archive\n"}})
         if self.path == "/api/coding-agents":
             return self._send({"ok": True, "nodes": [{"id": "code:mac:claude:s1", "source": "claude", "host": "mac", "name": "proj",
                                                       "cwd": "/w/proj", "status": "running", "detail": ["Bash: make"], "terminal": {}}]})
@@ -47,6 +51,13 @@ class Fake(BaseHTTPRequestHandler):
         Fake.log.append(("POST", self.path, self.headers.get("Authorization"), body))
         if self.path == "/api/coding-agents/ping":
             return self._send({"ok": True, "delivered": True, "title": "Claude Code · proj"})
+        if self.path == "/api/shared-memory/import":
+            return self._send({"ok": True, "files": len(body["files"]), "tokens_before": 900, "tokens_after": 300, "brief_tokens": 200,
+                               "pointer_tokens": 100, "added": 9, "deduped": 3, "superseded": 0, "skipped": 1,
+                               "slim": "<!-- joebro:memory:start -->\n# Project memory\npointer\n<!-- joebro:memory:end -->\n"})
+        if self.path == "/api/shared-memory":
+            return self._send({"ok": True, "outcome": "added", "fact": {"id": "sm_1", "text": body["text"], "topic": body["topic"],
+                                                                         "strength": 0.5, "status": "active", "scope": "project"}})
         if self.path == "/api/plugins/install":
             return self._send({"ok": True, "plugin": {"id": "plugin_x", "files": sorted(body["files"])}})
         return self._send({"ok": True})
@@ -68,7 +79,7 @@ class JoeBroCLITests(unittest.TestCase):
         Fake.log.clear()
         Fake.inbox.clear()
 
-    def run_cli(self, *args, stdin="", argv0=None, env=None):
+    def run_cli(self, *args, stdin="", argv0=None, env=None, cwd=None):
         e = dict(os.environ, HOME=self.home)
         for k in list(e):
             if k.startswith(("JOEBRO_", "CLAUDE", "CODEX_", "OPENCODE")):
@@ -76,7 +87,7 @@ class JoeBroCLITests(unittest.TestCase):
         e.update(env or {})
         cmd = [sys.executable, JOEBRO] if not argv0 else [sys.executable, "-c",
                "import sys,runpy; sys.argv=[%r]+sys.argv[1:]; runpy.run_path(%r, run_name='__main__')" % (argv0, JOEBRO)]
-        return subprocess.run(cmd + list(args), input=stdin, capture_output=True, text=True, env=e, timeout=30)
+        return subprocess.run(cmd + list(args), input=stdin, capture_output=True, text=True, env=e, timeout=30, cwd=cwd)
 
     def link(self):
         r = self.run_cli("link", self.url, "--token", "sekrit", "--host", "mac")
@@ -150,6 +161,88 @@ class JoeBroCLITests(unittest.TestCase):
         self.assertTrue({"joebro_ping", "coding_agent_send", "joebro_plugin_install"} <= names)
         self.assertEqual(json.loads(out[2]["result"]["content"][0]["text"])["agents"][0]["status"], "running")
         self.assertIn("error", out[3])
+
+    def repo(self):
+        d = os.path.join(tempfile.mkdtemp(), "proj")
+        os.makedirs(d)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        subprocess.run(["git", "-C", d, "remote", "add", "origin", "git@github.com:acme/proj.git"], check=True)
+        return os.path.realpath(d)
+
+    def test_session_start_injects_the_memory_brief_once(self):
+        self.link()
+        d = self.repo()
+        for source in ("claude", "codex"):
+            r = self.run_cli("report", source, stdin=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": d}))
+            out = json.loads(r.stdout)["hookSpecificOutput"]
+            self.assertEqual(out["hookEventName"], "SessionStart")
+            self.assertIn("make test", out["additionalContext"])
+        get = [x for x in Fake.log if x[1].startswith("/api/shared-memory/brief")][0][1]
+        self.assertIn("remote=git%40github.com%3Aacme%2Fproj.git", get)
+        # no per-turn injection: a prompt or a tool call prints nothing
+        for ev in ({"hook_event_name": "UserPromptSubmit", "prompt": "hi"}, {"hook_event_name": "PreToolUse", "tool_name": "Bash"}):
+            self.assertEqual(self.run_cli("report", "claude", stdin=json.dumps(dict(ev, session_id="s1", cwd=d))).stdout, "")
+        off = self.run_cli("report", "claude", stdin=json.dumps({"hook_event_name": "SessionStart", "session_id": "s1", "cwd": d}),
+                           env={"JOEBRO_MEMORY": "off"})
+        self.assertEqual(off.stdout, "")
+
+    def test_memory_tools_send_project_and_provenance(self):
+        self.link()
+        d = self.repo()
+        req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "memory_remember", "arguments": {"text": "Run tests with make test.", "topic": "testing"}}})
+        r = self.run_cli("mcp", stdin=req + "\n", cwd=d, env={"CLAUDECODE": "1"})
+        out = json.loads(json.loads(r.stdout)["result"]["content"][0]["text"])
+        self.assertEqual(out, {"ok": True, "fact": {"id": "sm_1", "text": "Run tests with make test.", "topic": "testing", "strength": 0.5},
+                               "outcome": "added"})
+        body = [x for x in Fake.log if x[1] == "/api/shared-memory"][0][3]
+        self.assertEqual((body["path"], body["remote"], body["agent"], body["host"], body["source"]),
+                         (d, "git@github.com:acme/proj.git", "claude", "mac", "mcp"))
+
+    def test_memory_import_replaces_agent_files_with_a_pointer(self):
+        self.link()
+        d = self.repo()
+        open(os.path.join(d, "CLAUDE.md"), "w").write("# Proj\n- Run tests with make test.\n" * 20)
+        open(os.path.join(d, "AGENTS.md"), "w").write("# Proj\n- Use tabs.\n" * 20)
+        os.makedirs(os.path.join(d, ".opencode"))
+        open(os.path.join(d, ".opencode", "AGENTS.md"), "w").write("- OpenCode rule one is here.\n")
+        mem = os.path.join(self.home, ".claude", "projects", d.replace("/", "-").replace("_", "-").replace(".", "-"), "memory")
+        os.makedirs(mem)
+        open(os.path.join(mem, "MEMORY.md"), "w").write("- The user prefers small commits.\n")
+        dry = self.run_cli("memory", "import", cwd=d)
+        self.assertIn("Nothing on disk was changed", dry.stdout)
+        self.assertIn("900 tokens before -> 300 after", dry.stdout)
+        self.assertTrue(open(os.path.join(d, "CLAUDE.md")).read().startswith("# Proj"))
+        sent = [x for x in Fake.log if x[1] == "/api/shared-memory/import"][0][3]
+        self.assertEqual(sorted(f["agent"] for f in sent["files"]), ["claude", "claude", "codex", "opencode"])
+        r = self.run_cli("memory", "import", "--write", cwd=d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for name in ("CLAUDE.md", "AGENTS.md"):
+            self.assertIn("joebro:memory:start", open(os.path.join(d, name)).read())
+        self.assertFalse(os.path.exists(os.path.join(d, ".opencode", "AGENTS.md")))
+        self.assertFalse(os.path.exists(os.path.join(mem, "MEMORY.md")))
+        self.assertTrue(os.path.exists(os.path.join(mem, "MEMORY.md.before-joebro")))
+        backups = sorted(os.listdir(os.path.join(d, ".joebro", "memory", "imported")))
+        self.assertEqual(backups, [".opencode_AGENTS.md", "AGENTS.md", "CLAUDE.md", "claude-memory_MEMORY.md"])
+        self.assertIn("make test", open(os.path.join(d, ".joebro", "memory", "MEMORY.md")).read())
+        again = self.run_cli("memory", "import", cwd=d)                # pointers are not re-imported
+        self.assertIn("No agent memory files found", again.stdout)
+
+    def test_install_wires_the_mcp_server_for_codex_and_opencode(self):
+        os.makedirs(os.path.join(self.home, ".codex"))
+        os.makedirs(os.path.join(self.home, ".config", "opencode"))
+        open(os.path.join(self.home, ".codex", "config.toml"), "w").write('model = "gpt-5"\n')
+        open(os.path.join(self.home, ".config", "opencode", "opencode.json"), "w").write('{"theme": "dark"}')
+        for _ in range(2):
+            self.assertEqual(self.run_cli("install").returncode, 0)
+        toml = open(os.path.join(self.home, ".codex", "config.toml")).read()
+        self.assertEqual(toml.count("[mcp_servers.joebro]"), 1)
+        self.assertTrue(toml.startswith('model = "gpt-5"'))
+        oc = json.load(open(os.path.join(self.home, ".config", "opencode", "opencode.json")))
+        self.assertEqual((oc["theme"], oc["mcp"]["joebro"]["command"][1]), ("dark", "mcp"))
+        self.run_cli("install", "--uninstall")
+        self.assertNotIn("joebro", open(os.path.join(self.home, ".codex", "config.toml")).read())
+        self.assertNotIn("joebro", json.load(open(os.path.join(self.home, ".config", "opencode", "opencode.json")))["mcp"])
 
     def test_plugin_init_then_push_sends_text_files(self):
         self.link()
