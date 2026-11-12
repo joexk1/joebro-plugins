@@ -14,6 +14,7 @@ Stdlib only. The git/agent helpers are jb_nightworker.py (same file the backend 
 import base64
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -43,6 +44,19 @@ def call(cfg, method, path, body=None, timeout=20):
             return e.code, {}
     except (OSError, ValueError):
         return 0, {}
+
+
+EXTRA_PATH = ["~/.local/bin", "~/.npm-global/bin", "~/.opencode/bin", "~/.claude/local", "~/.cargo/bin", "~/bin",
+              "/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/bin", "/usr/bin", "/bin"]
+
+
+def fix_path():
+    """systemd/launchd start us with a bare PATH: add where claude, codex, opencode and tmux usually live
+    (including every nvm node version), so shutil.which finds them as in a login shell."""
+    import glob
+    have = os.environ.get("PATH", "").split(os.pathsep)
+    extra = [os.path.expanduser(p) for p in EXTRA_PATH] + sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin")), reverse=True)
+    os.environ["PATH"] = os.pathsep.join(have + [p for p in extra if p not in have and os.path.isdir(p)])
 
 
 def is_repo(path):
@@ -107,11 +121,27 @@ def run_session(host, task, claim):
     if not worker.installed(agent, commands):
         return {"node": host, "status": "failed", "error": "%s is not installed on %s" % (agent, host)}
     try:
+        if not shutil.which("tmux") and agent in ("claude", "opencode"):
+            return run_headless(host, task, agent, commands)       # no tmux: still carry the session on (just not attachable)
         argv = worker.session_argv(agent, task["prompt"], task.get("model") or "", task.get("resume_id") or "", commands)
         out = worker.tmux_launch("jb-" + task["id"][3:], task["repo"], argv, {"JOEBRO_NIGHT_TASK": task["id"]})
     except ValueError as exc:
         return {"node": host, "status": "failed", "error": str(exc)[:300]}
     return {"node": host, "agent": agent, "status": "launched", "result": {"launch": out, "summary": "Session started on %s." % host}}
+
+
+def run_headless(host, task, agent, commands):
+    """Without tmux: resume/start the session in the background in print mode (hooks still report it; install tmux to attach)."""
+    import subprocess
+    argv = worker.agent_argv(agent, task["prompt"], task.get("model") or "", 0, commands, task.get("resume_id") or "")
+    logdir = os.path.join(os.path.expanduser("~"), ".local", "state", "joebro-agents")
+    os.makedirs(logdir, exist_ok=True)
+    logf = os.path.join(logdir, task["id"] + ".log")
+    with open(logf, "ab") as f:
+        subprocess.Popen(argv, cwd=task["repo"], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT, start_new_session=True,
+                         env=dict(os.environ, **{"JOEBRO_NIGHT_TASK": task["id"]}))
+    return {"node": host, "agent": agent, "status": "launched",
+            "result": {"launch": {"log": logf}, "summary": "Session continued on %s in the background (no tmux there; log %s)." % (host, logf)}}
 
 
 def do_pending(cfg, host, task):
@@ -128,8 +158,9 @@ def do_pending(cfg, host, task):
 
 def tick(cfg, host, dry=False, stop=None):
     """One pass. Returns a list of what was done (strings)."""
+    fix_path()
     done = []
-    code, data = call(cfg, "GET", "/api/night-shift")
+    code, data = call(cfg, "GET", "/api/night-shift?node=" + urllib.parse.quote(host))
     if code != 200:
         return ["backend unreachable or not a JoeBro with Night Shift (HTTP %s)" % code]
     tasks = data.get("tasks") or []

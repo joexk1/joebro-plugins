@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -171,6 +172,31 @@ class NodeRunnerTests(unittest.TestCase):
             self.assertEqual(self.task(t["id"])["status"], "launched")
         finally:
             subprocess.run([tmux, "kill-session", "-t", name], capture_output=True, env=self.env)
+
+    def test_bare_path_gets_the_agent_dirs_and_no_tmux_still_resumes_headless(self):
+        sys.path.insert(0, os.path.join(ROOT, "runtime"))
+        import jb_node
+        home = os.path.join(self.tmp, "h2"); fake = os.path.join(home, ".npm-global", "bin"); os.makedirs(fake)
+        out = os.path.join(self.tmp, "args.txt")
+        real_which = shutil.which
+        pathlib.Path(fake, "claude").write_text("#!/bin/sh\necho \"$@\" > %s\n" % out)
+        os.chmod(os.path.join(fake, "claude"), 0o755)
+        old_home, old_path = os.environ["HOME"], os.environ["PATH"]
+        os.environ["HOME"], os.environ["PATH"] = home, "/usr/bin:/bin"
+        try:
+            jb_node.fix_path()
+            self.assertIn(fake, os.environ["PATH"].split(os.pathsep))
+            with mock.patch("shutil.which", side_effect=lambda n, path=None: None if n == "tmux" else real_which(n, path=path)):
+                task = {"id": "ns_abc", "repo": self.tmp, "prompt": "carry on", "agent": "claude", "resume_id": "sid-1"}
+                rep = jb_node.run_session("pc", task, {"commands": {"claude": [os.path.join(fake, "claude"), "-p", "{prompt}"]}})
+            self.assertEqual(rep["status"], "launched")
+            for _ in range(50):
+                if os.path.exists(out) and os.path.getsize(out):
+                    break
+                time.sleep(0.1)
+            self.assertIn("carry on", open(out).read())
+        finally:
+            os.environ["HOME"], os.environ["PATH"] = old_home, old_path
 
     def test_runner_source_has_no_git_push(self):
         text = pathlib.Path(ROOT, "runtime", "jb_node.py").read_text().replace("never pushes", "")
