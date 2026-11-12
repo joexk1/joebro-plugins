@@ -394,8 +394,14 @@ def cmd_memory(argv):
         sys.exit(d.get("error") or d.get("detail"))
     print("Imported %d files (%d tokens): %d facts added, %d duplicates merged, %d skipped." % (
         d["files"], d["tokens_before"], d["added"], d["deduped"] + d["superseded"], d["skipped"]))
-    print("Per session: %d tokens before -> %d after (brief %d + pointer %d)." % (
-        d["tokens_before"], d["tokens_after"], d["brief_tokens"], d["pointer_tokens"]))
+    worth = False
+    for agent, before in sorted((d.get("per_agent_before") or {}).items()):
+        print("  %s: %d tokens of memory files per session -> %d (brief %d + pointer %d)" % (
+            agent, before, d["tokens_after"], d["brief_tokens"], d["pointer_tokens"]))
+        worth = worth or before > d["tokens_after"]
+    if write and not worth and "--force" not in argv:
+        print("These files are already smaller than a brief, so they were left as they are (--force to replace them anyway).")
+        return 0
     if is_global or not write:
         print("Nothing on disk was changed. %s" % ("User-wide files are left as they are; trim them by hand." if is_global else
                                                    "Run again with --write to replace these files with a short pointer:"))
@@ -585,23 +591,23 @@ TOOLS = [
          {"host": S, "harness": {"type": "string", "enum": ["claude", "codex", "opencode", "agy"]}, "cwd": S, "prompt": S}, ["host", "harness"], fn=t_launch),
     tool("coding_agent_wait", "Wait until an agent finishes its turn or needs approval (max 10 min). Returns its final lines.",
          dict(ID, timeout_s={"type": "integer", "minimum": 5, "maximum": 600}), ["id"], read=True, fn=t_wait),
-    tool("memory_recall", "Look up this project's shared memory (one store for every coding agent: decisions, conventions, gotchas, how to run and test). Returns a few short facts. Use it before guessing how this repo does something.",
+    tool("memory_recall", "Search this project's shared memory (decisions, conventions, gotchas, how to run/test). Returns a few short facts. Use before guessing how this repo does something.",
          {"query": S, "limit": {"type": "integer", "minimum": 1, "maximum": 10}, "include_archived": {"type": "boolean"}}, ["query"], read=True, fn=t_recall),
-    tool("memory_remember", "Save ONE durable fact about this project for every future agent session: a decision, a convention, a gotcha, or how to run/test something. One sentence. Not progress notes, not task summaries, never secrets. Duplicates are merged for you.",
-         {"text": S, "topic": dict(S, description="one word, e.g. testing, deploy, style"),
+    tool("memory_remember", "Save ONE durable fact for every future session: a decision, convention, gotcha, or how to run/test. One sentence. No progress notes, summaries or secrets.",
+         {"text": S, "topic": S,
           "kind": {"type": "string", "enum": ["fact", "decision", "convention", "gotcha", "howto"]},
-          "scope": {"type": "string", "enum": ["project", "global"], "description": "global = true for every repo"}}, ["text"], fn=t_remember),
-    tool("memory_supersede", "A remembered fact has changed: replace it with the new wording. The old one is kept as history.",
-         {"id": dict(S, description="fact id from memory_recall"), "text": S, "reason": S}, ["id", "text"], fn=t_supersede),
-    tool("memory_forget", "Archive a remembered fact that is wrong or no longer useful (archived, not deleted).",
+          "scope": {"type": "string", "enum": ["project", "global"]}}, ["text"], fn=t_remember),
+    tool("memory_supersede", "Replace a remembered fact that has changed (the old one is kept as history).",
+         {"id": S, "text": S, "reason": S}, ["id", "text"], fn=t_supersede),
+    tool("memory_forget", "Archive a remembered fact that is wrong or stale.",
          {"id": S, "reason": S}, ["id"], fn=t_forget),
-    tool("memory_project_brief", "The short memory brief for this project (the same one given at session start).", {}, read=True, fn=t_brief),
-    tool("night_shift_add", "Queue a coding task for JoeBro Night Shift: it runs unattended overnight in its own git worktree and waits for the user's review in the morning. Never pushes.",
-         {"prompt": S, "repo": dict(S, description="repo path; default: this one"), "title": S,
+    tool("memory_project_brief", "This project's memory brief (as given at session start).", {}, read=True, fn=t_brief),
+    tool("night_shift_add", "Queue a coding task to run unattended overnight in its own git worktree; the user reviews it in the morning. Never pushes.",
+         {"prompt": S, "repo": S, "title": S,
           "agent": {"type": "string", "enum": ["claude", "codex", "opencode", "any"]}, "model": S, "test_command": S,
-          "window_start": dict(S, description="HH:MM"), "window_end": dict(S, description="HH:MM")}, ["prompt"], fn=t_night_add),
-    tool("night_shift_list", "Night Shift tasks that are queued, running or waiting for review.", {}, read=True, fn=t_night_list),
-    tool("night_shift_cancel", "Cancel a queued Night Shift task (or stop a running one; its worktree is kept).", {"id": S}, ["id"], fn=t_night_cancel),
+          "window_start": S, "window_end": S}, ["prompt"], fn=t_night_add),
+    tool("night_shift_list", "Night Shift tasks: queued, running or awaiting review.", {}, read=True, fn=t_night_list),
+    tool("night_shift_cancel", "Cancel a queued Night Shift task, or stop a running one.", {"id": S}, ["id"], fn=t_night_cancel),
     tool("joebro_plugin_spec", "The JoeBro plugin standard (joebro.plugin/1): manifest, python tools, UI panels with the joebro.call bridge, install rules. Read it before building or editing a JoeBro plugin.", {}, read=True, fn=t_plugin_spec),
     tool("joebro_plugin_list", "List JoeBro plugins (built-in and custom): on/off, version, what each contributes (tools, guardrail, panels), errors.", {}, read=True, fn=t_plugin_list),
     tool("joebro_plugin_install", "Install or update a JoeBro plugin from a local folder (path) or a files map. Validated, staged and swapped atomically; the previous version is kept. New plugins start OFF unless enable=true (only when the user asked for it). Lists every validation problem at once.",

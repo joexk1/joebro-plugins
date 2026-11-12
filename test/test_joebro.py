@@ -52,7 +52,7 @@ class Fake(BaseHTTPRequestHandler):
         if self.path == "/api/coding-agents/ping":
             return self._send({"ok": True, "delivered": True, "title": "Claude Code · proj"})
         if self.path == "/api/shared-memory/import":
-            return self._send({"ok": True, "files": len(body["files"]), "tokens_before": 900, "tokens_after": 300, "brief_tokens": 200,
+            return self._send({"ok": True, "files": len(body["files"]), "tokens_before": 900, "tokens_after": 300, "per_agent_before": {"claude": 600, "codex": 300}, "brief_tokens": 200,
                                "pointer_tokens": 100, "added": 9, "deduped": 3, "superseded": 0, "skipped": 1,
                                "slim": "<!-- joebro:memory:start -->\n# Project memory\npointer\n<!-- joebro:memory:end -->\n"})
         if self.path == "/api/shared-memory":
@@ -211,7 +211,7 @@ class JoeBroCLITests(unittest.TestCase):
         open(os.path.join(mem, "MEMORY.md"), "w").write("- The user prefers small commits.\n")
         dry = self.run_cli("memory", "import", cwd=d)
         self.assertIn("Nothing on disk was changed", dry.stdout)
-        self.assertIn("900 tokens before -> 300 after", dry.stdout)
+        self.assertIn("claude: 600 tokens of memory files per session -> 300", dry.stdout)
         self.assertTrue(open(os.path.join(d, "CLAUDE.md")).read().startswith("# Proj"))
         sent = [x for x in Fake.log if x[1] == "/api/shared-memory/import"][0][3]
         self.assertEqual(sorted(f["agent"] for f in sent["files"]), ["claude", "claude", "codex", "opencode"])
