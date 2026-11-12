@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- Shared Memory: MCP tools `memory_recall`, `memory_remember`, `memory_supersede`, `memory_forget`, `memory_project_brief`; a brief of at most 400 tokens at session start (Claude Code, Codex, OpenCode); `joebro-agents memory import [--write]` moves CLAUDE.md / AGENTS.md / agent memory into the one store and leaves a short pointer.
+- Shared Memory: MCP tools `memory_recall`, `memory_remember`, `memory_supersede`, `memory_forget`, `memory_project_brief`; a brief of at most 400 tokens at session start (Claude Code, Codex, OpenCode); `joebro-agents memory import [--write] [--include-instructions]` moves Claude Code's learned memory into the one store and adds a short pointer block to CLAUDE.md and AGENTS.md, leaving their instructions as they are.
 - Night Shift: MCP tools `night_shift_add`, `night_shift_list`, `night_shift_cancel`.
 - Node runner: `joebro-agents node tick|run` claims Night Shift tasks and sessions for repos on this computer, runs them in a worktree through tmux and reports back; never pushes (needs the claim/report routes, see reports/requests.md).
 - Live subagents: Claude Code SubagentStart/SubagentStop hooks, Codex spawn_agent (best effort), OpenCode child sessions, all reported with the parent id.

@@ -11,7 +11,7 @@ One stdlib-only file (Python 3.9+) that is, depending on how it is called:
   joebro-agents ping "message" [--title T]    ping your phone through JoeBro
   joebro-agents agents                        list the coding agents JoeBro can see
   joebro-agents brief                         this repo's Shared Memory brief (what a session starts with)
-  joebro-agents memory import [--write] [--global]   move CLAUDE.md / AGENTS.md / agent memory into Shared Memory
+  joebro-agents memory import [--write] [--include-instructions] [--global]   move learned agent memory into Shared Memory; CLAUDE.md / AGENTS.md instructions stay
   joebro-agents memory mirror                 write .joebro/memory/MEMORY.md for this repo
   joebro-agents node tick|run [--every 60] [--dry-run]  run Night Shift tasks / start sessions for repos on THIS computer
   joebro-agents plugin init|push|list|spec|source|test|rollback ...
@@ -427,9 +427,7 @@ def cmd_memory(argv):
         sys.exit(d.get("error") or d.get("detail"))
     print("Imported %d files (%d tokens): %d facts added, %d duplicates merged, %d skipped." % (
         d["files"], d["tokens_before"], d["added"], d["deduped"] + d["superseded"], d["skipped"]))
-    for agent, before in sorted((d.get("per_agent_before") or {}).items()):
-        print("  %s: %d tokens of memory files per session -> %d (brief %d + pointer %d)" % (
-            agent, before, d["tokens_after"], d["brief_tokens"], d["pointer_tokens"]))
+    print("  Each session now starts with a %d-token brief from Shared Memory." % d["brief_tokens"])
     learned = [x for x in sources if not x[0].startswith(top + os.sep)]
     if is_global or not write:
         print("Nothing on disk was changed.%s" % ("" if is_global else
