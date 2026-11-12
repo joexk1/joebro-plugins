@@ -13,6 +13,7 @@ One stdlib-only file (Python 3.9+) that is, depending on how it is called:
   joebro-agents brief                         this repo's Shared Memory brief (what a session starts with)
   joebro-agents memory import [--write] [--global]   move CLAUDE.md / AGENTS.md / agent memory into Shared Memory
   joebro-agents memory mirror                 write .joebro/memory/MEMORY.md for this repo
+  joebro-agents node tick|run [--every 60] [--dry-run]  run Night Shift tasks / start sessions for repos on THIS computer
   joebro-agents plugin init|push|list|spec|source|test|rollback ...
 
 Aliases by file name (symlinks): joebro-agent-report = report, joebro-agents-mcp = mcp,
@@ -101,8 +102,10 @@ def detect_harness():
 
 
 # ----------------------------------------------------------------------------- hook reporter
+SPAWN_TOOLS = ("spawn_agent", "spawn_agents", "Task", "Agent")
 CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool",
-              "PermissionRequest": "waiting", "Stop": "stop", "SessionEnd": "end"}
+              "PermissionRequest": "waiting", "Stop": "stop", "SessionEnd": "end",
+              "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop"}
 
 
 def tool_text(inp):
@@ -128,6 +131,23 @@ def normalise(source, data):
             return None
         out = {"event": ev, "session_id": data.get("session_id") or data.get("thread_id") or "",
                "cwd": data.get("cwd") or os.getcwd(), "model": data.get("model") or ""}
+        # Live subagents (feature-api section 3). Claude Code tags SubagentStart/Stop and every hook fired INSIDE a
+        # subagent with its own agent_id; session_id stays the parent's. Report the subagent under its own id.
+        aid = str(data.get("agent_id") or "")
+        if aid and aid != out["session_id"]:
+            out.update(parent_session_id=out["session_id"], session_id=aid)
+            if data.get("agent_type"):
+                out["subagent_type"] = clip(data.get("agent_type"), 40)
+        if ev == "subagent_stop":
+            out["text"] = clip(data.get("last_assistant_message"), 200)
+        if ev == "tool" and source == "codex" and str(data.get("tool_name") or "") in SPAWN_TOOLS and not aid:
+            # Codex (as far as we can tell) sends no SubagentStart: the spawn tool call is the only signal, and there is
+            # no stop signal, so the child is closed with its parent's turn (ends_with_parent).
+            ti = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+            out["also"] = [{"event": "subagent_start", "session_id": "%s:sub:%s" % (out["session_id"], data.get("tool_use_id") or int(time.time() * 1000)),
+                            "parent_session_id": out["session_id"], "subagent_type": clip(ti.get("agent_type") or ti.get("agent") or "subagent", 40),
+                            "name": clip(ti.get("name") or ti.get("message") or ti.get("prompt"), 80), "ends_with_parent": True,
+                            "cwd": out["cwd"]}]
         if ev == "prompt":
             out["text"] = clip(data.get("prompt"), 200)
         elif ev == "tool":
@@ -174,7 +194,7 @@ def cmd_report(source):
     ev.update(source=source, host=cfg["host"])
     # Command channel: instructions queued for THIS agent are handed over here.
     # Stop -> Claude/Codex carry on with them (decision:block + reason); prompt -> extra context.
-    if source in ("claude", "codex") and ev["event"] in ("stop", "prompt"):
+    if source in ("claude", "codex") and ev["event"] in ("stop", "prompt") and not ev.get("parent_session_id"):
         msgs = pull(cfg, cfg["host"], source, ev["session_id"], "stop_hook" if ev["event"] == "stop" else "prompt_hook")
         if msgs:
             text = handover_text(msgs)
@@ -184,6 +204,7 @@ def cmd_report(source):
             else:
                 sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
             sys.stdout.flush()
+    also = ev.pop("also", [])
     if source in ("claude", "codex") and ev["event"] == "start" and memory_on(cfg):
         text = brief_text(ev.get("cwd") or os.getcwd(), cfg, timeout=1.5)     # once per session, <= 400 tokens
         if text:
@@ -209,7 +230,8 @@ def cmd_report(source):
             os.dup2(devnull, fd)
     except (OSError, AttributeError):
         pass
-    api("POST", "/api/coding-agents/event", ev, timeout=4, cfg=cfg)
+    for e in [ev] + [dict(x, source=source, host=cfg["host"], pid=ev["pid"]) for x in also]:
+        api("POST", "/api/coding-agents/event", e, timeout=4, cfg=cfg)
     os._exit(0)
 
 
@@ -707,6 +729,34 @@ def show(r):
     return 0 if not (isinstance(r, dict) and r.get("ok") is False) else 1
 
 
+def cmd_node(argv):
+    """The node runner (runtime/jb_node.py): claims queued Night Shift tasks whose repo is on this computer, runs them
+    in a worktree through tmux, reports back. No daemon: `tick` is one pass, `run` loops."""
+    cfg = config()
+    if not cfg["linked"]:
+        print("not linked: run `joebro-agents link <url>` first")
+        return 1
+    here = os.path.dirname(os.path.abspath(__file__))
+    for d in (os.path.join(here, "..", "runtime"), os.path.join(here, "..", "..", "runtime"), here):
+        if os.path.isfile(os.path.join(d, "jb_node.py")):
+            sys.path.insert(0, d)
+            break
+    else:
+        print("jb_node.py not found next to this script (plugins/runtime)")
+        return 1
+    import jb_node
+    sub = argv[0] if argv else "tick"
+    if sub == "tick":
+        out = jb_node.tick(cfg, cfg["host"], dry="--dry-run" in argv)
+        print("\n".join(out) or "nothing to do on %s" % cfg["host"])
+        return 0
+    if sub == "run":
+        every = int(argv[argv.index("--every") + 1]) if "--every" in argv else 60
+        return jb_node.run_loop(cfg, cfg["host"], every)
+    print("usage: joebro-agents node tick [--dry-run] | run [--every SECONDS]")
+    return 2
+
+
 def cmd_plugin(argv):
     """joebro-agents plugin init <id> [dir] | push <dir> [--enable] | list | spec | source <id> <dir> | test <id> <tool> [json] | rollback <id>"""
     cmd = argv[0] if argv else "help"
@@ -804,7 +854,7 @@ def cmd_status():
     return 0
 
 
-CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Notification", "Stop", "SessionEnd"]
+CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]
 CODEX_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop"]
 MARK = "joebro"
 
@@ -953,6 +1003,8 @@ def main():
         return cmd_mcp()
     if cmd == "plugin":
         return cmd_plugin(rest)
+    if cmd == "node":
+        return cmd_node(rest)
     if cmd == "ping":
         return cmd_ping(rest)
     if cmd == "agents":

@@ -27,7 +27,9 @@ export const JoeBro = async ({ directory, client }) => {
       })
     } catch {}
   }
+  const parents = new Map()   // child session id -> parent session id (OpenCode subagents are child sessions)
   const send = (ev) => {
+    if (ev?.session_id && parents.has(ev.session_id) && !ev.parent_session_id) ev = { ...ev, parent_session_id: parents.get(ev.session_id) }
     try {
       const child = spawn(JOEBRO, ["report", "opencode"], { detached: true, stdio: ["pipe", "ignore", "ignore"] })
       child.on("error", () => {})
@@ -68,13 +70,24 @@ export const JoeBro = async ({ directory, client }) => {
       const sid = p.sessionID ?? p.info?.id
       if (!sid) return
       switch (event.type) {
-        case "session.created": return send({ event: "start", session_id: sid, name: clip(p.info?.title, 80) })
-        case "session.idle": deliver(sid); return send({ event: "stop", session_id: sid })
+        case "session.created":
+          if (p.info?.parentID) {   // a child session = a subagent (the Task tool); the parent is another session
+            parents.set(sid, p.info.parentID)
+            return send({ event: "subagent_start", session_id: sid, parent_session_id: p.info.parentID, name: clip(p.info?.title, 80),
+                          subagent_type: clip((p.info?.title || "").match(/\(@([\w-]+) subagent\)/)?.[1] || "subagent", 40) })
+          }
+          return send({ event: "start", session_id: sid, name: clip(p.info?.title, 80) })
+        case "session.idle":
+          if (parents.has(sid)) return send({ event: "subagent_stop", session_id: sid })   // the child's own idle closes it
+          deliver(sid); return send({ event: "stop", session_id: sid })
         case "session.status":
-          if (p.status?.type === "idle") { deliver(sid); return send({ event: "stop", session_id: sid }) }
+          if (p.status?.type === "idle") {
+            if (parents.has(sid)) return send({ event: "subagent_stop", session_id: sid })
+            deliver(sid); return send({ event: "stop", session_id: sid })
+          }
           return
-        case "session.error": return send({ event: "stop", session_id: sid, text: "error" })
-        case "session.deleted": return send({ event: "end", session_id: sid })
+        case "session.error": return send({ event: parents.has(sid) ? "subagent_stop" : "stop", session_id: sid, text: "error" })
+        case "session.deleted": { const sub = parents.has(sid); const r = send({ event: sub ? "subagent_stop" : "end", session_id: sid }); parents.delete(sid); return r }
         case "permission.asked":
         case "permission.updated": return send({ event: "waiting", session_id: sid, text: clip(p.title ?? p.type ?? "needs approval", 160) })
       }

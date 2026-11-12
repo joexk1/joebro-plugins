@@ -110,6 +110,53 @@ class JoeBroCLITests(unittest.TestCase):
         self.assertEqual(oct(os.stat(cfg).st_mode & 0o777), "0o600")
         self.assertEqual(json.load(open(cfg))["host"], "mac")
 
+    def test_claude_subagent_events_carry_the_parent_id(self):
+        self.link()
+        base = {"session_id": "parent1", "cwd": "/w/proj"}
+        self.run_cli("report", "claude", stdin=json.dumps(dict(base, hook_event_name="SubagentStart", agent_id="a1", agent_type="Explore")))
+        self.run_cli("report", "claude", stdin=json.dumps(dict(base, hook_event_name="PreToolUse", agent_id="a1", agent_type="Explore",
+                                                                tool_name="Bash", tool_input={"command": "ls"})))
+        self.run_cli("report", "claude", stdin=json.dumps(dict(base, hook_event_name="SubagentStop", agent_id="a1", agent_type="Explore",
+                                                                last_assistant_message="found 3 files")))
+        import time
+        for _ in range(60):
+            evs = [x[3] for x in Fake.log if x[1] == "/api/coding-agents/event"]
+            if len(evs) >= 3:
+                break
+            time.sleep(0.05)
+        by = {e["event"]: e for e in evs}
+        self.assertEqual((by["subagent_start"]["session_id"], by["subagent_start"]["parent_session_id"], by["subagent_start"]["subagent_type"]),
+                         ("a1", "parent1", "Explore"))
+        self.assertEqual((by["tool"]["session_id"], by["tool"]["parent_session_id"]), ("a1", "parent1"))
+        self.assertEqual((by["subagent_stop"]["session_id"], by["subagent_stop"]["text"]), ("a1", "found 3 files"))
+
+    def test_subagent_stop_never_pulls_the_parents_messages(self):
+        self.link()
+        Fake.inbox.append({"from": "joebro", "text": "for the parent"})
+        r = self.run_cli("report", "claude", stdin=json.dumps({"hook_event_name": "SubagentStop", "session_id": "p", "agent_id": "a1"}))
+        self.assertEqual(r.stdout, "")
+        self.assertEqual(len(Fake.inbox), 1)
+
+    def test_codex_spawn_agent_tool_reports_a_child_that_ends_with_its_parent(self):
+        self.link()
+        self.run_cli("report", "codex", stdin=json.dumps({"hook_event_name": "PreToolUse", "session_id": "c1", "cwd": "/w/proj",
+                                                           "tool_name": "spawn_agent", "tool_use_id": "t9", "tool_input": {"message": "review the diff"}}))
+        import time
+        for _ in range(60):
+            evs = [x[3] for x in Fake.log if x[1] == "/api/coding-agents/event"]
+            if len(evs) >= 2:
+                break
+            time.sleep(0.05)
+        kinds = {e["event"]: e for e in evs}
+        self.assertIn("tool", kinds)
+        sub = kinds["subagent_start"]
+        self.assertEqual((sub["session_id"], sub["parent_session_id"], sub["ends_with_parent"], sub["source"], sub["host"]), ("c1:sub:t9", "c1", True, "codex", "mac"))
+
+    def test_plugin_hooks_json_lists_subagent_hooks(self):
+        hooks = json.load(open(os.path.join(ROOT, "claude-code", "hooks", "hooks.json")))["hooks"]
+        self.assertIn("SubagentStart", hooks)
+        self.assertIn("SubagentStop", hooks)
+
     def test_hook_is_silent_and_does_nothing_when_unlinked(self):
         r = self.run_cli("report", "claude", stdin=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}))
         self.assertEqual((r.returncode, r.stdout), (0, ""))
