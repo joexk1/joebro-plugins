@@ -246,7 +246,7 @@ class JoeBroCLITests(unittest.TestCase):
         self.assertEqual((body["path"], body["remote"], body["agent"], body["host"], body["source"]),
                          (d, "git@github.com:acme/proj.git", "claude", "mac", "mcp"))
 
-    def test_memory_import_replaces_agent_files_with_a_pointer(self):
+    def test_memory_import_keeps_instructions_and_moves_learned_memory(self):
         self.link()
         d = self.repo()
         open(os.path.join(d, "CLAUDE.md"), "w").write("# Proj\n- Run tests with make test.\n" * 20)
@@ -258,22 +258,25 @@ class JoeBroCLITests(unittest.TestCase):
         open(os.path.join(mem, "MEMORY.md"), "w").write("- The user prefers small commits.\n")
         dry = self.run_cli("memory", "import", cwd=d)
         self.assertIn("Nothing on disk was changed", dry.stdout)
-        self.assertIn("claude: 600 tokens of memory files per session -> 300", dry.stdout)
-        self.assertTrue(open(os.path.join(d, "CLAUDE.md")).read().startswith("# Proj"))
         sent = [x for x in Fake.log if x[1] == "/api/shared-memory/import"][0][3]
-        self.assertEqual(sorted(f["agent"] for f in sent["files"]), ["claude", "claude", "codex", "opencode"])
+        self.assertEqual([f["agent"] for f in sent["files"]], ["claude"])        # learned memory only
         r = self.run_cli("memory", "import", "--write", cwd=d)
         self.assertEqual(r.returncode, 0, r.stderr)
-        for name in ("CLAUDE.md", "AGENTS.md"):
-            self.assertIn("joebro:memory:start", open(os.path.join(d, name)).read())
-        self.assertFalse(os.path.exists(os.path.join(d, ".opencode", "AGENTS.md")))
+        for name, rule in (("CLAUDE.md", "make test"), ("AGENTS.md", "Use tabs")):
+            text = open(os.path.join(d, name)).read()
+            self.assertTrue(text.startswith("# Proj") and rule in text and text.count("joebro:memory:start") == 1)
+        self.assertTrue(os.path.exists(os.path.join(d, ".opencode", "AGENTS.md")))
         self.assertFalse(os.path.exists(os.path.join(mem, "MEMORY.md")))
         self.assertTrue(os.path.exists(os.path.join(mem, "MEMORY.md.before-joebro")))
-        backups = sorted(os.listdir(os.path.join(d, ".joebro", "memory", "imported")))
-        self.assertEqual(backups, [".opencode_AGENTS.md", "AGENTS.md", "CLAUDE.md", "claude-memory_MEMORY.md"])
-        self.assertIn("make test", open(os.path.join(d, ".joebro", "memory", "MEMORY.md")).read())
-        again = self.run_cli("memory", "import", cwd=d)                # pointers are not re-imported
-        self.assertIn("No agent memory files found", again.stdout)
+        self.assertEqual(os.listdir(os.path.join(d, ".joebro", "memory", "imported")), ["claude-memory_MEMORY.md"])
+        again = self.run_cli("memory", "import", "--write", cwd=d)          # idempotent: one pointer block
+        self.assertIn("No learned agent memory found", again.stdout)
+        self.assertEqual(open(os.path.join(d, "AGENTS.md")).read().count("joebro:memory:start"), 1)
+        Fake.log.clear()
+        self.run_cli("memory", "import", "--include-instructions", cwd=d)
+        sent = [x for x in Fake.log if x[1] == "/api/shared-memory/import"][0][3]
+        self.assertEqual(sorted(f["agent"] for f in sent["files"]), ["claude", "codex", "opencode"])
+        self.assertNotIn("joebro:memory", "".join(f["text"] for f in sent["files"]))
 
     def test_install_wires_the_mcp_server_for_codex_and_opencode(self):
         os.makedirs(os.path.join(self.home, ".codex"))

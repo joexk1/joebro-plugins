@@ -341,11 +341,15 @@ def t_night_cancel(a):
     return d if d.get("ok") is False else {"ok": True, "task": _night(d["task"])}
 
 
-# The agents' own memory files this replaces. Repo files are rewritten to a pointer on --write.
+# Instruction files (build commands, conventions, rules) stay where they are: --write only adds a
+# short pointer block to CLAUDE.md and AGENTS.md. What moves into Shared Memory is the agents' own
+# learned memory (Claude Code's auto-memory folder). --include-instructions also reads facts out of
+# the instruction files, without changing them.
 REPO_MEMORY_FILES = [("CLAUDE.md", "claude"), ("CLAUDE.local.md", "claude"), (".claude/CLAUDE.md", "claude"),
                      ("AGENTS.md", "codex"), ("AGENTS.override.md", "codex"), (".opencode/AGENTS.md", "opencode")]
 GLOBAL_MEMORY_FILES = [(".claude/CLAUDE.md", "claude"), (".codex/AGENTS.md", "codex"), (".config/opencode/AGENTS.md", "opencode")]
 POINTER_FILES = ("CLAUDE.md", "AGENTS.md")
+MEM_END = "<!-- joebro:memory:end -->"
 MEM_MARK = "<!-- joebro:memory:start -->"
 
 
@@ -357,31 +361,35 @@ def _read(path):
         return ""
 
 
-def memory_sources(top, is_global=False):
-    """[(absolute path, agent, text)] for one repo (or the user-wide files with --global)."""
+def strip_pointer(text):
+    return re.sub(re.escape(MEM_MARK) + r".*?" + re.escape(MEM_END) + r"\n?", "", text, flags=re.S)
+
+
+def memory_sources(top, is_global=False, instructions=False):
+    """[(absolute path, agent, text)] for one repo (or the user-wide files with --global).
+    Instruction files are included only when asked; learned memory always is."""
     out = []
     if is_global:
-        cands = [(os.path.join(HOME, rel), agent) for rel, agent in GLOBAL_MEMORY_FILES]
+        cands = [(os.path.join(HOME, rel), agent) for rel, agent in GLOBAL_MEMORY_FILES] if instructions else []
     else:
-        cands = [(os.path.join(top, rel), agent) for rel, agent in REPO_MEMORY_FILES]
+        cands = [(os.path.join(top, rel), agent) for rel, agent in REPO_MEMORY_FILES] if instructions else []
         try:        # OpenCode rules listed in opencode.json
-            for rel in json.loads(_read(os.path.join(top, "opencode.json")) or "{}").get("instructions") or []:
+            for rel in (json.loads(_read(os.path.join(top, "opencode.json")) or "{}").get("instructions") or []) if instructions else []:
                 if isinstance(rel, str) and "*" not in rel and "://" not in rel:
                     cands.append((os.path.join(top, rel), "opencode"))
         except ValueError:
             pass
+    if not is_global:
         mem = os.path.join(HOME, ".claude", "projects", re.sub(r"[^A-Za-z0-9]", "-", top), "memory")   # Claude Code auto-memory
         if os.path.isdir(mem):
             cands += [(os.path.join(mem, n), "claude") for n in sorted(os.listdir(mem)) if n.endswith(".md")]
     seen = set()
     for path, agent in cands:
         real = os.path.realpath(path)
-        text = _read(path)
+        text = strip_pointer(_read(path))
         if real in seen or not text.strip():
             continue
         seen.add(real)
-        if MEM_MARK in text and len(text) < 1200:
-            continue                    # already a pointer
         out.append((path, agent, text))
     return out
 
@@ -403,11 +411,14 @@ def cmd_memory(argv):
         print("wrote " + dest)
         return 0
     if sub != "import":
-        sys.exit("usage: joebro-agents memory import [--write] [--global] | mirror")
+        sys.exit("usage: joebro-agents memory import [--write] [--include-instructions] [--global] | mirror")
     is_global, write = "--global" in argv, "--write" in argv
-    sources = memory_sources(top, is_global)
+    sources = memory_sources(top, is_global, "--include-instructions" in argv)
     if not sources:
-        print("No agent memory files found%s." % ("" if is_global else " in " + top))
+        print("No learned agent memory found%s. Instruction files (CLAUDE.md, AGENTS.md) are left as they are; "
+              "--include-instructions also reads facts from them." % ("" if is_global else " for " + top))
+        if write and not is_global:
+            add_pointers(top, d=None, ctx=ctx, cfg=cfg)
         return 0
     body = dict({"project": "global"} if is_global else ctx, host=cfg["host"], agent="import",
                 files=[{"path": p, "agent": agent, "text": text} for p, agent, text in sources])
@@ -416,38 +427,44 @@ def cmd_memory(argv):
         sys.exit(d.get("error") or d.get("detail"))
     print("Imported %d files (%d tokens): %d facts added, %d duplicates merged, %d skipped." % (
         d["files"], d["tokens_before"], d["added"], d["deduped"] + d["superseded"], d["skipped"]))
-    worth = False
     for agent, before in sorted((d.get("per_agent_before") or {}).items()):
         print("  %s: %d tokens of memory files per session -> %d (brief %d + pointer %d)" % (
             agent, before, d["tokens_after"], d["brief_tokens"], d["pointer_tokens"]))
-        worth = worth or before > d["tokens_after"]
-    if write and not worth and "--force" not in argv:
-        print("These files are already smaller than a brief, so they were left as they are (--force to replace them anyway).")
-        return 0
+    learned = [x for x in sources if not x[0].startswith(top + os.sep)]
     if is_global or not write:
-        print("Nothing on disk was changed. %s" % ("User-wide files are left as they are; trim them by hand." if is_global else
-                                                   "Run again with --write to replace these files with a short pointer:"))
-        for p, _, _ in sources:
+        print("Nothing on disk was changed.%s" % ("" if is_global else
+              " Run again with --write to add a short Shared Memory pointer to CLAUDE.md and AGENTS.md"
+              " (your instructions in them stay as they are)" + (" and move Claude Code's learned memory into Shared Memory:" if learned else ".")))
+        for p, _, _ in learned:
             print("  " + p)
         return 0
     backup = os.path.join(top, ".joebro", "memory", "imported")
     os.makedirs(backup, exist_ok=True)
-    for p, _, text in sources:          # originals are kept; memory is now the single source of truth
-        name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.relpath(p, top) if p.startswith(top) else "claude-memory_" + os.path.basename(p))
-        with open(os.path.join(backup, name), "w") as f:
+    for p, _, text in learned:          # only learned memory moves; originals are kept
+        with open(os.path.join(backup, "claude-memory_" + os.path.basename(p)), "w") as f:
             f.write(text)
-        if p.startswith(top + os.sep) and os.path.relpath(p, top) not in POINTER_FILES:
-            os.remove(p)
-        elif not p.startswith(top + os.sep):
-            os.replace(p, p + ".before-joebro")
+        os.replace(p, p + ".before-joebro")
+    add_pointers(top, d, ctx, cfg)
+    print("Added a Shared Memory pointer to CLAUDE.md and AGENTS.md; their instructions are unchanged."
+          + (" Learned memory moved; originals: " + backup if learned else ""))
+    return 0
+
+
+def add_pointers(top, d, ctx, cfg):
+    """Append (or refresh) the pointer block in CLAUDE.md and AGENTS.md, keeping everything else."""
+    block = (d or {}).get("slim") or api("POST", "/api/shared-memory/import", dict(ctx, host=cfg["host"], agent="import", files=[]),
+                                         cfg=cfg).get("slim", "")
+    if not block:
+        return
     for name in POINTER_FILES:
-        with open(os.path.join(top, name), "w") as f:
-            f.write(d["slim"])
+        path = os.path.join(top, name)
+        old = strip_pointer(_read(path)).rstrip()
+        with open(path, "w") as f:
+            f.write((old + "\n\n" if old else "") + block)
+    os.makedirs(os.path.join(top, ".joebro", "memory"), exist_ok=True)
     for name, text in (api("GET", "/api/shared-memory/mirror?" + urllib.parse.urlencode(ctx), cfg=cfg).get("files") or {}).items():
         with open(os.path.join(top, ".joebro", "memory", os.path.basename(name)), "w") as f:
             f.write(text)
-    print("CLAUDE.md and AGENTS.md now point at Shared Memory. Originals: " + backup)
-    return 0
 
 
 # ----------------------------------------------------------------------------- tools (shared by MCP + CLI)
