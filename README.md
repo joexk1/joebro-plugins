@@ -25,7 +25,7 @@ repo
 
 ## Install
 
-You need Python 3.9 or newer (macOS ships it) and JoeBro 1.4 or newer.
+You need Python 3.9 or newer (macOS ships it) and JoeBro 1.4 or newer (1.5 for Shared Memory and Night Shift).
 
 ```sh
 git clone https://github.com/joexk1/joebro-plugins ~/.joebro-plugins
@@ -67,6 +67,26 @@ args = ["mcp"]</pre>
     </td>
   </tr>
 </table>
+
+## Shared Memory and Night Shift (JoeBro 1.5)
+
+**Shared Memory** is for what your agents learn as they work: decisions, gotchas, what was tried. Claude Code, Codex and OpenCode all read and write it through the MCP server (`memory_recall`, `memory_remember`), and each session starts with a brief of at most about 400 tokens. Your instructions (build commands, conventions, rules) stay in CLAUDE.md and AGENTS.md.
+
+```sh
+joebro-agents memory import            # dry run: shows what it would do
+joebro-agents memory import --write    # moves Claude Code's learned memory across (backed up) and
+                                       # adds a short pointer block to CLAUDE.md and AGENTS.md
+```
+
+`--write` never removes or rewrites what's already in CLAUDE.md or AGENTS.md; it only appends one pointer block, and running it again doesn't add a second. `--include-instructions` also copies facts out of those files into Shared Memory, still without changing them.
+
+**Night Shift** runs queued coding tasks on the computers that have the repo. Run the node runner on each computer you want to take tasks:
+
+```sh
+joebro-agents node run --every 30      # keep it running (a systemd user unit or a LaunchAgent works well)
+```
+
+Each task runs in its own git worktree and branch, through tmux if it's installed (so you can attach and watch; Codex tasks need tmux), and reports the diff and test result back for review. It never pushes.
 
 ## Pings
 
