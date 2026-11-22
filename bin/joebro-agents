@@ -120,6 +120,46 @@ def tool_text(inp):
     return ""
 
 
+def new_assistant_text(path, sid):
+    """Latest written (not tool) text in a Claude Code transcript, once per message."""
+    if not path or not os.path.isfile(str(path)):
+        return ""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 262144))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("type") == "user" and not isinstance((row.get("message") or {}).get("content"), list):
+            return ""                      # reached the prompt: nothing written since
+        if row.get("type") != "assistant":
+            continue
+        parts = [c.get("text", "") for c in (row.get("message") or {}).get("content") or []
+                 if isinstance(c, dict) and c.get("type") == "text" and c.get("text", "").strip()]
+        if not parts:
+            continue
+        uid = str(row.get("uuid") or hash(parts[-1]))
+        mark = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "said-" + re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
+        try:
+            if open(mark).read() == uid:
+                return ""
+        except OSError:
+            pass
+        try:
+            os.makedirs(os.path.dirname(mark), exist_ok=True)
+            open(mark, "w").write(uid)
+        except OSError:
+            pass
+        return "\n\n".join(parts).strip()
+    return ""
+
+
 def normalise(source, data):
     if source in ("claude", "codex"):
         name = data.get("hook_event_name") or data.get("event") or ""
@@ -139,7 +179,7 @@ def normalise(source, data):
             if data.get("agent_type"):
                 out["subagent_type"] = clip(data.get("agent_type"), 40)
         if ev == "subagent_stop":
-            out["text"] = clip(data.get("last_assistant_message"), 200)
+            out["text"] = clip(data.get("last_assistant_message"), 4000)
         if ev == "tool" and source == "codex" and str(data.get("tool_name") or "") in SPAWN_TOOLS and not aid:
             # Codex (as far as we can tell) sends no SubagentStart: the spawn tool call is the only signal, and there is
             # no stop signal, so the child is closed with its parent's turn (ends_with_parent).
@@ -149,14 +189,17 @@ def normalise(source, data):
                             "name": clip(ti.get("name") or ti.get("message") or ti.get("prompt"), 80), "ends_with_parent": True,
                             "cwd": out["cwd"]}]
         if ev == "prompt":
-            out["text"] = clip(data.get("prompt"), 200)
+            out["text"] = clip(data.get("prompt"), 4000)
         elif ev == "tool":
             out["tool"] = clip(data.get("tool_name"), 60)
             out["text"] = tool_text(data.get("tool_input"))
+            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            if said:
+                out["said"] = clip(said, 4000)      # what the agent wrote before this tool call, shown as its reply
         elif ev == "waiting":
             out["text"] = clip(data.get("message") or ("approve " + str(data.get("tool_name") or "")), 160)
         elif ev == "stop":
-            out["text"] = clip(data.get("last_assistant_message"), 200)
+            out["text"] = clip(data.get("last_assistant_message"), 4000)
         return out
     if source == "opencode":   # the opencode plugin already normalises
         return data if data.get("event") else None
