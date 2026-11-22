@@ -185,6 +185,11 @@ def normalise(source, data):
                 out["subagent_type"] = clip(data.get("agent_type"), 40)
         if ev == "subagent_stop":
             out["text"] = clip(data.get("last_assistant_message"), 4000)
+        if ev == "stop" and not aid:
+            # Everything written since the last report, not just the final message.
+            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            if said:
+                out["said"] = clip(said, 4000)
         if ev == "tool" and source == "codex" and str(data.get("tool_name") or "") in SPAWN_TOOLS and not aid:
             # Codex (as far as we can tell) sends no SubagentStart: the spawn tool call is the only signal, and there is
             # no stop signal, so the child is closed with its parent's turn (ends_with_parent).
@@ -227,8 +232,8 @@ def pull(cfg, host, source, sid, via):
 
 
 def handover_text(msgs):
-    return "\n\n".join(("Message from JoeBro: %s" % m.get("text")) if (m.get("from") or "joebro").lower() == "joebro"
-                       else "Message from %s via JoeBro: %s" % (m.get("from"), m.get("text")) for m in msgs)
+    # Exactly what was typed, like a message sent in the terminal.
+    return "\n\n".join(str(m.get("text") or "") for m in msgs)
 
 
 def cmd_report(source):
@@ -253,17 +258,15 @@ def cmd_report(source):
                     {"stop": "stop_hook", "prompt": "prompt_hook"}.get(ev["event"], "tool_hook"))
         if msgs:
             text = handover_text(msgs)
-            # systemMessage prints it in your terminal too, so it reads like a message you sent.
-            shown = "\n".join("\u2709 From %s: %s" % ((m.get("from") or "JoeBro").replace("joebro", "JoeBro"), m.get("text") or "") for m in msgs)
             if ev["event"] == "tool_done":
-                sys.stdout.write(json.dumps({"systemMessage": shown,
+                sys.stdout.write(json.dumps({
                                              "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
                 ev.update(event="prompt", text=clip(text, 4000))
             elif ev["event"] == "stop":
-                sys.stdout.write(json.dumps({"systemMessage": shown, "decision": "block", "reason": text}))
+                sys.stdout.write(json.dumps({"decision": "block", "reason": text}))
                 ev.update(event="prompt", text=clip(text, 4000))
             else:
-                sys.stdout.write(json.dumps({"systemMessage": shown,
+                sys.stdout.write(json.dumps({
                                              "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
             sys.stdout.flush()
     also = ev.pop("also", [])
