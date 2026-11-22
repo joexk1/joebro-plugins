@@ -11,6 +11,7 @@ import re
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -267,6 +268,11 @@ def tmux_launch(name, cwd, argv, env=None):
     cmd = [tmux, "new-session", "-d", "-s", name, "-c", cwd]
     for k, v in (env or {}).items():
         cmd += ["-e", "%s=%s" % (k, v)]
+    # Under systemd the node's cgroup is killed on restart/update, and a tmux server
+    # started from it would die with it (taking every open session along). Give the
+    # session its own scope so it outlives the node. (launchd: tmux already detaches.)
+    if sys.platform.startswith("linux") and os.environ.get("INVOCATION_ID") and shutil.which("systemd-run"):
+        cmd = ["systemd-run", "--user", "--scope", "--quiet", "--collect"] + cmd
     p = subprocess.run(cmd + argv, capture_output=True, text=True, timeout=20)
     if p.returncode != 0:
         raise ValueError("tmux could not start the session: " + (p.stderr or p.stdout).strip()[:200])

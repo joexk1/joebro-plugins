@@ -420,8 +420,13 @@ def cmd_report(source):
     if os.environ.get("JOEBRO_NIGHT_TASK"):
         ev["night_task"] = os.environ["JOEBRO_NIGHT_TASK"]
     ev.setdefault("pid", os.getppid())
+    in_tmux = bool(os.environ.get("TMUX_PANE"))
     for env, key in (("KITTY_WINDOW_ID", "kitty_window_id"), ("KITTY_LISTEN_ON", "kitty_listen_on"),
                      ("TMUX_PANE", "tmux_pane"), ("TERM_PROGRAM", "term")):
+        # Inside tmux, Kitty variables are inherited from whichever terminal started the
+        # tmux server: they'd point at someone else's window, so they're not ours to report.
+        if in_tmux and env.startswith("KITTY_"):
+            continue
         if os.environ.get(env) and not ev.get(key):
             ev[key] = os.environ[env]
     try:                               # detach: the harness never waits on the network

@@ -14,6 +14,7 @@ Stdlib only. The git/agent helpers are jb_nightworker.py (same file the backend 
 import base64
 import json
 import os
+import re
 import shutil
 import sys
 import threading
@@ -126,10 +127,32 @@ def run_session(host, task, claim):
         if not shutil.which("tmux") and agent in ("claude", "opencode"):
             return run_headless(host, task, agent, commands)       # no tmux: still carry the session on (just not attachable)
         argv = worker.session_argv(agent, task["prompt"], task.get("model") or "", task.get("resume_id") or "", commands, task.get("permission") or "")
-        out = worker.tmux_launch("jb-" + task["id"][3:], task["repo"], argv, {"JOEBRO_NIGHT_TASK": task["id"]})
+        name = "jb-" + task["id"][3:]
+        out = worker.tmux_launch(name, task["repo"], argv, {"JOEBRO_NIGHT_TASK": task["id"]})
+        threading.Thread(target=accept_folder_trust, args=(name,), daemon=True).start()
     except ValueError as exc:
         return {"node": host, "status": "failed", "error": str(exc)[:300]}
     return {"node": host, "agent": agent, "status": "launched", "result": {"launch": out, "summary": "Session started on %s." % host}}
+
+
+TRUST_PROMPT = re.compile(r"trust this folder|Do you trust the files|Trust and continue|trust the authors", re.I)
+
+
+def accept_folder_trust(name, seconds=20):
+    """A new folder makes Claude Code / Codex ask "trust this folder?" before anything
+    else, a prompt nobody sees from the app. Picking the folder in JoeBro is that
+    consent, so answer it (Enter = the default "Yes, trust") once, then stop watching."""
+    import subprocess
+    end = time.time() + seconds
+    while time.time() < end:
+        time.sleep(1)
+        try:
+            screen = subprocess.run(["tmux", "capture-pane", "-pt", name], capture_output=True, text=True, timeout=5).stdout
+        except Exception:
+            return
+        if TRUST_PROMPT.search(screen or ""):
+            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], timeout=5)
+            return
 
 
 def run_headless(host, task, agent, commands):
