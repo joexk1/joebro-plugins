@@ -176,7 +176,7 @@ class JoeBroCLITests(unittest.TestCase):
         r = self.run_cli("report", "claude", stdin=json.dumps({"hook_event_name": "Stop", "session_id": "s1"}))
         out = json.loads(r.stdout)
         self.assertEqual(out["decision"], "block")
-        self.assertEqual(out["reason"], "Message from JoeBro: also run the tests")
+        self.assertEqual(out["reason"], "also run the tests")
         self.assertEqual(self.wait_for("/api/coding-agents/event")[0][3]["event"], "prompt")
 
     def test_legacy_alias_and_opencode_pull(self):
