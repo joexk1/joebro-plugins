@@ -121,7 +121,7 @@ def tool_text(inp):
 
 
 def new_assistant_text(path, sid):
-    """Latest written (not tool) text in a Claude Code transcript, once per message."""
+    """Every written (not tool) text in a Claude Code transcript since the last report, oldest first."""
     if not path or not os.path.isfile(str(path)):
         return ""
     try:
@@ -131,13 +131,19 @@ def new_assistant_text(path, sid):
             lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return ""
+    mark = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "said-" + re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
+    try:
+        seen = open(mark).read().strip()
+    except OSError:
+        seen = ""
+    found, newest = [], ""
     for line in reversed(lines):
         try:
             row = json.loads(line)
         except ValueError:
             continue
         if row.get("type") == "user" and not isinstance((row.get("message") or {}).get("content"), list):
-            return ""                      # reached the prompt: nothing written since
+            break                          # reached the prompt
         if row.get("type") != "assistant":
             continue
         parts = [c.get("text", "") for c in (row.get("message") or {}).get("content") or []
@@ -145,19 +151,18 @@ def new_assistant_text(path, sid):
         if not parts:
             continue
         uid = str(row.get("uuid") or hash(parts[-1]))
-        mark = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "said-" + re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
-        try:
-            if open(mark).read() == uid:
-                return ""
-        except OSError:
-            pass
-        try:
-            os.makedirs(os.path.dirname(mark), exist_ok=True)
-            open(mark, "w").write(uid)
-        except OSError:
-            pass
-        return "\n\n".join(parts).strip()
-    return ""
+        if uid == seen:
+            break                          # everything older was already reported
+        newest = newest or uid
+        found.append("\n\n".join(parts).strip())
+    if not newest:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(mark), exist_ok=True)
+        open(mark, "w").write(newest)
+    except OSError:
+        pass
+    return "\n\n".join(reversed(found))
 
 
 def normalise(source, data):
@@ -196,6 +201,10 @@ def normalise(source, data):
             said = new_assistant_text(data.get("transcript_path"), out["session_id"])
             if said:
                 out["said"] = clip(said, 4000)      # what the agent wrote before this tool call, shown as its reply
+        elif ev == "tool_done":
+            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            if said:
+                out["said"] = clip(said, 4000)
         elif ev == "waiting":
             out["text"] = clip(data.get("message") or ("approve " + str(data.get("tool_name") or "")), 160)
         elif ev == "stop":
