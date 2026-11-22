@@ -72,7 +72,9 @@ def pick_agent(task, claim):
 
 
 def runnable(task, host):
-    return (task.get("status") == "queued" and task.get("host") in ("", None, host) and is_repo(task.get("repo")))
+    # Night Shift tasks need git (worktree, diff, review); a plain session just needs the folder to exist here.
+    where = os.path.isdir(task.get("repo") or "") if task.get("kind") == "session" else is_repo(task.get("repo"))
+    return task.get("status") == "queued" and task.get("host") in ("", None, host) and where
 
 
 def log(msg):
@@ -133,7 +135,10 @@ def run_session(host, task, claim):
 def run_headless(host, task, agent, commands):
     """Without tmux: resume/start the session in the background in print mode (hooks still report it; install tmux to attach)."""
     import subprocess
-    argv = worker.agent_argv(agent, task["prompt"], task.get("model") or "", 0, commands, task.get("resume_id") or "")
+    prompt = task.get("prompt") or ("Continue where you left off." if task.get("resume_id") else "")
+    if not prompt:
+        return {"node": host, "status": "failed", "error": "Give it a first message (or install tmux on %s to open it interactively)" % host}
+    argv = worker.agent_argv(agent, prompt, task.get("model") or "", 0, commands, task.get("resume_id") or "")
     logdir = os.path.join(os.path.expanduser("~"), ".local", "state", "joebro-agents")
     os.makedirs(logdir, exist_ok=True)
     logf = os.path.join(logdir, task["id"] + ".log")

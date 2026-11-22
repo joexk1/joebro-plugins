@@ -104,7 +104,7 @@ def detect_harness():
 # ----------------------------------------------------------------------------- hook reporter
 SPAWN_TOOLS = ("spawn_agent", "spawn_agents", "Task", "Agent")
 CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool", "PostToolUse": "tool_done",
-              "PermissionRequest": "waiting", "Stop": "stop", "SessionEnd": "end",
+              "PermissionRequest": "waiting", "Stop": "stop", "StopFailure": "stop", "SessionEnd": "end",
               "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop"}
 
 
@@ -165,6 +165,141 @@ def new_assistant_text(path, sid):
     return "\n\n".join(reversed(found))
 
 
+def _tail_lines(path, n=262144):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - n))
+            return f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+
+
+def codex_rollout(data):
+    """Path of this Codex session's rollout file: transcript_path if the hook passes it, else found by session id."""
+    p = data.get("transcript_path") or data.get("rollout_path")
+    if p and os.path.isfile(str(p)):
+        return str(p)
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", str(data.get("session_id") or data.get("thread_id") or ""))
+    if not sid:
+        return ""
+    try:
+        import glob
+        hits = glob.glob(os.path.expanduser("~/.codex/sessions/*/*/*/rollout-*%s*.jsonl" % sid))
+        return max(hits, key=os.path.getmtime) if hits else ""
+    except Exception:
+        return ""
+
+
+def new_codex_text(path, sid):
+    """Assistant messages in a Codex rollout (response_item/message/assistant) since the last report, oldest first."""
+    if not path or not os.path.isfile(str(path)):
+        return ""
+    mark = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "said-" + re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
+    try:
+        seen = open(mark).read().strip()
+    except OSError:
+        seen = ""
+    found, newest = [], ""
+    for line in reversed(_tail_lines(path)):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        pl = row.get("payload") if isinstance(row, dict) else None
+        if not isinstance(pl, dict):
+            continue
+        if row.get("type") == "event_msg" and pl.get("type") == "user_message":
+            break                          # reached the prompt
+        if row.get("type") != "response_item" or pl.get("type") != "message" or pl.get("role") != "assistant":
+            continue
+        parts = [c.get("text", "") for c in pl.get("content") or []
+                 if isinstance(c, dict) and c.get("type") in ("output_text", "text") and c.get("text", "").strip()]
+        if not parts:
+            continue
+        uid = str(pl.get("id") or row.get("ordinal") or row.get("timestamp") or hash(parts[-1]))
+        if uid == seen:
+            break
+        newest = newest or uid
+        found.append("\n\n".join(parts).strip())
+    if not newest:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(mark), exist_ok=True)
+        open(mark, "w").write(newest)
+    except OSError:
+        pass
+    return "\n\n".join(reversed(found))
+
+
+def said_since(source, data, sid):
+    try:
+        if source == "codex":
+            return new_codex_text(codex_rollout(data), sid)
+        return new_assistant_text(data.get("transcript_path"), sid)
+    except Exception:
+        return ""
+
+
+LIMIT_RX = re.compile(r"usage limit|rate.?limit|limit reached|hit your limit|reached your limit|resets? (at|in|on)\b|resets \d|"
+                      r"overloaded|credit balance|quota|insufficient[_ ]funds|too many requests|\b(429|529)\b|api error", re.I)
+
+
+def limit_notice(text):
+    """Short human line when text reads like a usage/rate limit or API error, else ''."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not t or len(t) > 1500 or not LIMIT_RX.search(t):
+        return ""
+    m = re.search(r"resets?\s+(?:at\s+|in\s+|on\s+)?([^.|\n(]{1,40}?)(?:\s*\(|\.|\||$)", t, re.I)
+    when = (" \u2014 resets " + m.group(1).strip()) if m else ""
+    low = t.lower()
+    if "credit balance" in low or "insufficient" in low:
+        return "Credit balance too low" + when
+    if "overloaded" in low or "529" in low:
+        return "API overloaded, try again shortly"
+    if "usage limit" in low or "limit reached" in low or "hit your limit" in low or "reached your limit" in low or "quota" in low:
+        return "Usage limit reached" + when
+    if "rate" in low or "too many" in low or "429" in low:
+        return "Rate limited" + when
+    return clip(t, 120)
+
+
+def stop_notice(source, data):
+    """Look for a limit/API error in the stop payload, its last message and the transcript tail."""
+    try:
+        cands = [data.get("error"), data.get("error_details"), data.get("stop_reason"), data.get("last_assistant_message")]
+        for c in cands:
+            if isinstance(c, (dict, list)):
+                c = json.dumps(c)
+            n = limit_notice(c)
+            if n and (c is not cands[3] or len(str(c)) < 600):
+                return n
+        path = codex_rollout(data) if source == "codex" else data.get("transcript_path")
+        if not path or not os.path.isfile(str(path)):
+            return ""
+        for line in reversed(_tail_lines(path, 65536)[-12:]):
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            pl = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+            if source == "codex":
+                if row.get("type") == "event_msg" and pl.get("type") in ("error", "stream_error"):
+                    return limit_notice(pl.get("message")) or clip(pl.get("message"), 120)
+                if row.get("type") == "event_msg" and pl.get("type") in ("task_complete", "user_message"):
+                    return ""
+            else:
+                msg = row.get("message") if isinstance(row.get("message"), dict) else {}
+                if row.get("type") == "user" and not isinstance(msg.get("content"), list):
+                    return ""
+                if row.get("type") == "assistant" and (row.get("isApiErrorMessage") or row.get("error")):
+                    txt = " ".join(c.get("text", "") for c in msg.get("content") or [] if isinstance(c, dict))
+                    return limit_notice(txt) or limit_notice(row.get("error")) or clip(txt, 120)
+        return ""
+    except Exception:
+        return ""
+
+
 def normalise(source, data):
     if source in ("claude", "codex"):
         name = data.get("hook_event_name") or data.get("event") or ""
@@ -187,9 +322,12 @@ def normalise(source, data):
             out["text"] = clip(data.get("last_assistant_message"), 4000)
         if ev == "stop" and not aid:
             # Everything written since the last report, not just the final message.
-            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            said = said_since(source, data, out["session_id"])
             if said:
                 out["said"] = clip(said, 4000)
+            notice = stop_notice(source, data)
+            if notice:
+                out["notice"] = notice
         if ev == "tool" and source == "codex" and str(data.get("tool_name") or "") in SPAWN_TOOLS and not aid:
             # Codex (as far as we can tell) sends no SubagentStart: the spawn tool call is the only signal, and there is
             # no stop signal, so the child is closed with its parent's turn (ends_with_parent).
@@ -203,11 +341,13 @@ def normalise(source, data):
         elif ev == "tool":
             out["tool"] = clip(data.get("tool_name"), 60)
             out["text"] = tool_text(data.get("tool_input"))
-            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            said = said_since(source, data, out["session_id"])
             if said:
                 out["said"] = clip(said, 4000)      # what the agent wrote before this tool call, shown as its reply
+            else:
+                out["_recheck"] = (codex_rollout(data) if source == "codex" else data.get("transcript_path")) or ""   # text often lands in the transcript just after this hook
         elif ev == "tool_done":
-            said = new_assistant_text(data.get("transcript_path"), out["session_id"])
+            said = said_since(source, data, out["session_id"])
             if said:
                 out["said"] = clip(said, 4000)
         elif ev == "waiting":
@@ -295,8 +435,16 @@ def cmd_report(source):
             os.dup2(devnull, fd)
     except (OSError, AttributeError):
         pass
+    recheck = ev.pop("_recheck", "")
     for e in [ev] + [dict(x, source=source, host=cfg["host"], pid=ev["pid"]) for x in also]:
         api("POST", "/api/coding-agents/event", e, timeout=4, cfg=cfg)
+    if recheck:
+        time.sleep(1.5)
+        said = new_codex_text(recheck, ev["session_id"]) if source == "codex" else new_assistant_text(recheck, ev["session_id"])
+        if said:
+            api("POST", "/api/coding-agents/event", {"event": "tool_done", "session_id": ev["session_id"], "source": source,
+                                                      "host": cfg["host"], "said": clip(said, 4000), "pid": ev["pid"],
+                                                      "cwd": ev.get("cwd", "")}, timeout=4, cfg=cfg)
     os._exit(0)
 
 
