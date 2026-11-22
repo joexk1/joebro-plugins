@@ -123,7 +123,7 @@ def run_session(host, task, claim):
     try:
         if not shutil.which("tmux") and agent in ("claude", "opencode"):
             return run_headless(host, task, agent, commands)       # no tmux: still carry the session on (just not attachable)
-        argv = worker.session_argv(agent, task["prompt"], task.get("model") or "", task.get("resume_id") or "", commands)
+        argv = worker.session_argv(agent, task["prompt"], task.get("model") or "", task.get("resume_id") or "", commands, task.get("permission") or "")
         out = worker.tmux_launch("jb-" + task["id"][3:], task["repo"], argv, {"JOEBRO_NIGHT_TASK": task["id"]})
     except ValueError as exc:
         return {"node": host, "status": "failed", "error": str(exc)[:300]}

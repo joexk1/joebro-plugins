@@ -103,7 +103,7 @@ def detect_harness():
 
 # ----------------------------------------------------------------------------- hook reporter
 SPAWN_TOOLS = ("spawn_agent", "spawn_agents", "Task", "Agent")
-CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool",
+CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool", "PostToolUse": "tool_done",
               "PermissionRequest": "waiting", "Stop": "stop", "SessionEnd": "end",
               "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop"}
 
@@ -237,15 +237,25 @@ def cmd_report(source):
     ev.update(source=source, host=cfg["host"])
     # Command channel: instructions queued for THIS agent are handed over here.
     # Stop -> Claude/Codex carry on with them (decision:block + reason); prompt -> extra context.
-    if source in ("claude", "codex") and ev["event"] in ("stop", "prompt") and not ev.get("parent_session_id"):
-        msgs = pull(cfg, cfg["host"], source, ev["session_id"], "stop_hook" if ev["event"] == "stop" else "prompt_hook")
+    # PostToolUse (Claude) -> delivered mid-turn as context, so a queued message lands within one tool step.
+    deliver = ("stop", "prompt", "tool_done") if source == "claude" else ("stop", "prompt")
+    if source in ("claude", "codex") and ev["event"] in deliver and not ev.get("parent_session_id"):
+        msgs = pull(cfg, cfg["host"], source, ev["session_id"],
+                    {"stop": "stop_hook", "prompt": "prompt_hook"}.get(ev["event"], "tool_hook"))
         if msgs:
             text = handover_text(msgs)
-            if ev["event"] == "stop":
-                sys.stdout.write(json.dumps({"decision": "block", "reason": text}))
-                ev.update(event="prompt", text=clip(text, 200))
+            # systemMessage prints it in your terminal too, so it reads like a message you sent.
+            shown = "\n".join("\u2709 From %s: %s" % ((m.get("from") or "JoeBro").replace("joebro", "JoeBro"), m.get("text") or "") for m in msgs)
+            if ev["event"] == "tool_done":
+                sys.stdout.write(json.dumps({"systemMessage": shown,
+                                             "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
+                ev.update(event="prompt", text=clip(text, 4000))
+            elif ev["event"] == "stop":
+                sys.stdout.write(json.dumps({"systemMessage": shown, "decision": "block", "reason": text}))
+                ev.update(event="prompt", text=clip(text, 4000))
             else:
-                sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
+                sys.stdout.write(json.dumps({"systemMessage": shown,
+                                             "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
             sys.stdout.flush()
     also = ev.pop("also", [])
     if source in ("claude", "codex") and ev["event"] == "start" and memory_on(cfg):
@@ -912,7 +922,7 @@ def cmd_status():
     return 0
 
 
-CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]
+CLAUDE_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Notification", "SubagentStart", "SubagentStop", "Stop", "SessionEnd"]
 CODEX_EVENTS = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PermissionRequest", "Stop"]
 MARK = "joebro"
 
