@@ -90,6 +90,13 @@ export const JoeBro = async ({ directory, client }) => {
         case "session.deleted": { const sub = parents.has(sid); const r = send({ event: sub ? "subagent_stop" : "end", session_id: sid }); parents.delete(sid); return r }
         case "permission.asked":
         case "permission.updated": return send({ event: "waiting", session_id: sid, text: clip(p.title ?? p.type ?? "needs approval", 160) })
+        case "question.asked": {   // its question tool: the apps show the menu read off the terminal
+          const q = p.questions?.[0]?.question ?? p.question ?? p.title ?? "a question"
+          return send({ event: "waiting", session_id: sid, text: clip("Question: " + q, 160) })
+        }
+        case "permission.replied":
+        case "question.replied":
+        case "question.rejected": return send({ event: "tool_done", session_id: sid })
       }
     },
   }

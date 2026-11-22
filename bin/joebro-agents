@@ -300,6 +300,9 @@ def stop_notice(source, data):
         return ""
 
 
+QUESTION_TOOLS = {"AskUserQuestion", "request_user_input", "question"}
+
+
 def normalise(source, data):
     if source in ("claude", "codex"):
         name = data.get("hook_event_name") or data.get("event") or ""
@@ -307,6 +310,9 @@ def normalise(source, data):
         if name == "Notification":
             msg = str(data.get("message") or "")
             ev = "waiting" if "permission" in msg.lower() or "approv" in msg.lower() else None
+        tname = str(data.get("tool_name") or "")
+        if ev == "tool" and tname in QUESTION_TOOLS and not data.get("agent_id"):
+            ev = "waiting"      # it's asking you something: the apps show the menu from its screen
         if not ev:
             return None
         out = {"event": ev, "session_id": data.get("session_id") or data.get("thread_id") or "",
@@ -350,6 +356,11 @@ def normalise(source, data):
             said = said_since(source, data, out["session_id"])
             if said:
                 out["said"] = clip(said, 4000)
+        elif ev == "waiting" and tname in QUESTION_TOOLS:
+            ti = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+            qs = ti.get("questions") if isinstance(ti.get("questions"), list) else []
+            q = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") or ti.get("question") or ti.get("prompt") or "a question"
+            out["text"] = clip("Question: " + str(q), 160)
         elif ev == "waiting":
             out["text"] = clip(data.get("message") or ("approve " + str(data.get("tool_name") or "")), 160)
         elif ev == "stop":

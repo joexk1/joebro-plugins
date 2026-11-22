@@ -141,7 +141,8 @@ TRUST_PROMPT = re.compile(r"trust this folder|Do you trust the files|Trust and c
 def accept_folder_trust(name, seconds=20):
     """A new folder makes Claude Code / Codex ask "trust this folder?" before anything
     else, a prompt nobody sees from the app. Picking the folder in JoeBro is that
-    consent, so answer it (Enter = the default "Yes, trust") once, then stop watching."""
+    consent, so pick its "Yes, trust" option once, then stop watching. (Which option is
+    highlighted first differs by version: newer Claude Code starts on "No, exit".)"""
     import subprocess
     end = time.time() + seconds
     while time.time() < end:
@@ -151,8 +152,31 @@ def accept_folder_trust(name, seconds=20):
         except Exception:
             return
         if TRUST_PROMPT.search(screen or ""):
-            subprocess.run(["tmux", "send-keys", "-t", name, "Enter"], timeout=5)
+            for key in trust_keys(screen):
+                subprocess.run(["tmux", "send-keys", "-t", name, key], timeout=5)
+                time.sleep(0.1)
             return
+
+
+def trust_keys(screen):
+    """Keys that pick the "yes / trust" row of a trust menu: arrows from the highlighted
+    row, then Enter (works for numbered and unnumbered menus alike)."""
+    rows = []
+    for line in (screen or "").splitlines():
+        m = re.match(r"^\s*([❯›>])?\s*(?:(\d)[.)]\s+)?(\S.{0,70})$", line)
+        if m and (m.group(1) or m.group(2) or (rows and line.startswith(" "))) and len(line.strip()) < 75:
+            rows.append((bool(m.group(1)), m.group(2), m.group(3).strip()))
+        elif rows and not line.strip():
+            continue
+        elif rows and any(r[0] for r in rows):
+            break
+        else:
+            rows = []
+    yes = next((n for n, r in enumerate(rows) if re.match(r"(yes|trust|i trust)", r[2], re.I)), None)
+    if yes is None:
+        return ["Enter"]
+    cur = next((n for n, r in enumerate(rows) if r[0]), 0)
+    return (["Down"] * (yes - cur) if yes > cur else ["Up"] * (cur - yes)) + ["Enter"]
 
 
 def run_headless(host, task, agent, commands):
