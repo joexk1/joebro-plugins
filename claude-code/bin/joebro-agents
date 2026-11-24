@@ -384,6 +384,66 @@ def _ancestor_pid(target_comm):
     return os.getppid()
 
 
+def _agy_app_dir(data=None):
+    d = os.environ.get("ANTIGRAVITY_APP_DATA_DIR")
+    if d and os.path.isdir(d):
+        return d
+    tp = (data or {}).get("transcriptPath") or (data or {}).get("artifactDirectoryPath") or ""
+    m = re.match(r"^(.+?)/brain/", str(tp))
+    if m and os.path.isdir(m.group(1)):
+        return m.group(1)
+    return os.path.join(HOME, ".gemini", "antigravity-cli")
+
+
+def _agy_role_cache(parent_sid, agent_type="", role=None):
+    """Remember the Role passed to invoke_subagent on the parent so the child conversation
+    can display its human-readable role name instead of just 'self'."""
+    path = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "agy-roles.json")
+    try:
+        d = json.load(open(path))
+        if not isinstance(d, dict):
+            d = {}
+    except Exception:
+        d = {}
+    key = "%s:%s" % (parent_sid, agent_type or "self")
+    if role is not None:
+        d[key] = {"role": clip(role, 80), "at": time.time()}
+        now = time.time()
+        d = {k: v for k, v in d.items() if isinstance(v, dict) and now - v.get("at", 0) < 3600}
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, "w").write(json.dumps(d))
+        except OSError:
+            pass
+        return role
+    entry = d.get(key)
+    return entry.get("role", "") if isinstance(entry, dict) else ""
+
+
+def _agy_parent(sid, data=None):
+    """(parent_conversation_id, agent_name, title) for an Antigravity conversation from its
+    local conversation_summaries.db (read-only), or ('', '', '') for a root conversation."""
+    if not sid:
+        return "", "", ""
+    db = os.path.join(_agy_app_dir(data), "conversation_summaries.db")
+    if not os.path.isfile(db):
+        return "", "", ""
+    try:
+        import sqlite3
+        con = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(db), uri=True, timeout=0.5)
+        try:
+            row = con.execute(
+                "SELECT parent_conversation_id, agent_name, title FROM conversation_summaries WHERE conversation_id=?",
+                (sid,)).fetchone()
+            if row and row[0]:
+                return str(row[0]), str(row[1] or ""), str(row[2] or "")
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return "", "", ""
+
+
 def _agy_continued(sid, set_to=None):
     """Track whether our Stop hook just continued this Antigravity turn so the ensuing
     PreInvocation does not re-report the previous user prompt as a duplicate."""
@@ -479,11 +539,23 @@ def normalise(source, data):
         targs = tc.get("args") if isinstance(tc.get("args"), dict) else (data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {})
         tpath = data.get("transcriptPath") or data.get("transcript_path") or ""
         out = {"session_id": sid, "cwd": cwd, "model": model}
+        par, agent_name, title = _agy_parent(sid, data)
+        is_sub = bool(par and par != sid)
+        if is_sub:
+            out["parent_session_id"] = par
+            out["subagent_type"] = clip(agent_name or "subagent", 40)
+            role = title or _agy_role_cache(par, agent_name) or agent_name or "subagent"
+            out["name"] = clip(role, 80)
         if name == "SessionStart":
-            out["event"] = "start"
+            out["event"] = "subagent_start" if is_sub else "start"
             return out
         if name == "PreInvocation":
             inv = int(data.get("invocationNum") or 0)
+            if is_sub:
+                if inv == 0:
+                    out["event"] = "subagent_start"
+                    return out
+                return None
             if inv == 0:
                 if _agy_continued(sid, set_to=False):
                     out.update(event="prompt", _skip_post=True)
@@ -493,24 +565,19 @@ def normalise(source, data):
             out["event"] = "pre_invocation"
             return out
         if name == "PreToolUse":
-            if tname in QUESTION_TOOLS:
+            if tname in QUESTION_TOOLS and not is_sub:
                 qs = targs.get("questions") if isinstance(targs.get("questions"), list) else []
                 q = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") or targs.get("question") or targs.get("prompt") or "a question"
                 out.update(event="waiting", text=clip("Question: " + str(q), 160))
                 return out
+            if tname == "invoke_subagent" and not is_sub:
+                _agy_role_cache(sid, str(targs.get("TypeName") or "self"), str(targs.get("Role") or targs.get("Prompt") or ""))
             out.update(event="tool", tool=clip(tname, 60), text=tool_text(targs))
             said = said_since("agy", data, sid)
             if said:
                 out["said"] = clip(said, 4000)
-            elif tpath:
+            elif tpath and not is_sub:
                 out["_recheck"] = tpath
-            if tname in SPAWN_TOOLS:
-                out["also"] = [{"event": "subagent_start",
-                                "session_id": "%s:sub:%s" % (sid, tc.get("id") or int(time.time() * 1000)),
-                                "parent_session_id": sid,
-                                "subagent_type": clip(targs.get("TypeName") or targs.get("agent_type") or "subagent", 40),
-                                "name": clip(targs.get("Role") or targs.get("name") or targs.get("Prompt"), 80),
-                                "ends_with_parent": True, "cwd": cwd}]
             return out
         if name == "PostToolUse":
             out["event"] = "tool_done"
@@ -519,8 +586,11 @@ def normalise(source, data):
                 out["said"] = clip(said, 4000)
             return out
         if name == "Stop":
-            out["event"] = "stop"
             said = said_since("agy", data, sid)
+            if is_sub:
+                out.update(event="subagent_stop", text=clip(said, 4000))
+                return out
+            out["event"] = "stop"
             if said:
                 out["said"] = clip(said, 4000)
             notice = stop_notice("agy", data)
@@ -528,7 +598,7 @@ def normalise(source, data):
                 out["notice"] = notice
             return out
         if name == "SessionEnd":
-            out["event"] = "end"
+            out["event"] = "subagent_stop" if is_sub else "end"
             return out
         return None
     if source == "opencode":   # the opencode plugin already normalises

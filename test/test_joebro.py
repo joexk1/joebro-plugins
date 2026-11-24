@@ -338,10 +338,27 @@ class JoeBroCLITests(unittest.TestCase):
             "hookEventName": "PreInvocation", "conversationId": "ag1", "cwd": d, "invocationNum": 0,
             "lastUserInput": "fix the build", "modelName": "gemini-4-neon-high"
         }))
-        # PreToolUse with invoke_subagent reports tool + subagent_start
+        # PreToolUse with invoke_subagent caches Role on parent; child's own hooks read conversation_summaries.db
+        import sqlite3
+        gdir = os.path.join(self.home, ".gemini", "antigravity-cli")
+        os.makedirs(gdir, exist_ok=True)
+        con = sqlite3.connect(os.path.join(gdir, "conversation_summaries.db"))
+        con.execute("CREATE TABLE conversation_summaries(conversation_id TEXT PRIMARY KEY, parent_conversation_id TEXT, agent_name TEXT, title TEXT)")
+        con.execute("INSERT INTO conversation_summaries VALUES('ag_sub1', 'ag1', 'research', '')")
+        con.commit(); con.close()
         self.run_cli("report", "agy", stdin=json.dumps({
             "hookEventName": "PreToolUse", "conversationId": "ag1", "cwd": d,
             "toolCall": {"id": "c1", "name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Codebase Researcher", "Prompt": "find hooks"}}
+        }))
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "SessionStart", "conversationId": "ag_sub1", "cwd": d
+        }))
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreToolUse", "conversationId": "ag_sub1", "cwd": d,
+            "toolCall": {"id": "sc1", "name": "read_file", "args": {"Path": "/w/proj/a.py"}}
+        }))
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "Stop", "conversationId": "ag_sub1", "cwd": d, "terminationReason": "NO_TOOL_CALL"
         }))
         # PreToolUse with ask_question reports waiting
         self.run_cli("report", "agy", stdin=json.dumps({
@@ -374,19 +391,20 @@ class JoeBroCLITests(unittest.TestCase):
         import time
         for _ in range(60):
             evs = [x[3] for x in Fake.log if x[1] == "/api/coding-agents/event" and x[3].get("source") == "agy"]
-            if len(evs) >= 6:
+            if len(evs) >= 8:
                 break
             time.sleep(0.05)
         kinds = [e["event"] for e in evs]
         self.assertIn("start", kinds)
         self.assertIn("tool", kinds)
         self.assertIn("subagent_start", kinds)
+        self.assertIn("subagent_stop", kinds)
         self.assertIn("waiting", kinds)
         waiting_ev = next(e for e in evs if e["event"] == "waiting")
         self.assertEqual(waiting_ev["text"], "Question: Which branch?")
         sub_ev = next(e for e in evs if e["event"] == "subagent_start")
-        self.assertEqual((sub_ev["parent_session_id"], sub_ev["subagent_type"], sub_ev["name"], sub_ev["ends_with_parent"]),
-                         ("ag1", "research", "Codebase Researcher", True))
+        self.assertEqual((sub_ev["session_id"], sub_ev["parent_session_id"], sub_ev["subagent_type"], sub_ev["name"]),
+                         ("ag_sub1", "ag1", "research", "Codebase Researcher"))
         said_ev = next((e for e in evs if e.get("said")), None)
         self.assertIsNotNone(said_ev)
         self.assertEqual(said_ev["said"], "Build is green now.")
