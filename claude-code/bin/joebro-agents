@@ -357,6 +357,15 @@ def stop_notice(source, data):
 QUESTION_TOOLS = {"AskUserQuestion", "request_user_input", "question", "ask_question"}
 
 
+def _is_print_mode(pid):
+    """True when the enclosing harness process was launched non-interactively (-p/--print)."""
+    try:
+        args = open("/proc/%d/cmdline" % int(pid), "rb").read().split(b"\0")
+        return any(a in (b"-p", b"--print", b"--prompt") for a in args[1:])
+    except Exception:
+        return False
+
+
 def _ancestor_pid(target_comm):
     """Find the enclosing harness process PID when hooks run via sh -c (Linux /proc, else ppid)."""
     pid = os.getppid()
@@ -613,10 +622,14 @@ def cmd_report(source):
         ev["night_task"] = os.environ["JOEBRO_NIGHT_TASK"]
     ev.setdefault("pid", _ancestor_pid("agy") if source == "agy" else os.getppid())
     in_tmux = bool(os.environ.get("TMUX_PANE"))
+    print_run = _is_print_mode(ev["pid"])
     for env, key in (("KITTY_WINDOW_ID", "kitty_window_id"), ("KITTY_LISTEN_ON", "kitty_listen_on"),
                      ("TMUX_PANE", "tmux_pane"), ("TERM_PROGRAM", "term")):
         # Inside tmux, Kitty variables are inherited from whichever terminal started the
         # tmux server: they'd point at someone else's window, so they're not ours to report.
+        # Non-interactive (-p/--print) runs also inherit an enclosing terminal without owning it.
+        if print_run and env in ("KITTY_WINDOW_ID", "KITTY_LISTEN_ON", "TMUX_PANE"):
+            continue
         if in_tmux and env.startswith("KITTY_"):
             continue
         if os.environ.get(env) and not ev.get(key):

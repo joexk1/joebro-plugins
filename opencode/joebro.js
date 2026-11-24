@@ -10,8 +10,10 @@ const clip = (s, n = 200) => String(s ?? "").replace(/\s+/g, " ").trim().slice(0
 
 export const JoeBro = async ({ directory, client }) => {
   // Instructions queued for this session by JoeBro: delivered as a new prompt
-  // when the session goes idle.
+  // when the session goes idle. A `/model provider/model` message switches the
+  // model used for subsequent JoeBro prompts in this session.
   const pulling = new Set()
+  const sessionModel = new Map()
   const deliver = (sid) => {
     if (pulling.has(sid)) return
     pulling.add(sid)
@@ -22,8 +24,23 @@ export const JoeBro = async ({ directory, client }) => {
         let msgs = []
         try { msgs = JSON.parse(out || "[]") } catch { return }
         if (!msgs.length) return
-        const text = msgs.map((m) => (!m.from || m.from.toLowerCase() === "joebro") ? `Message from JoeBro: ${m.text}` : `Message from ${m.from} via JoeBro: ${m.text}`).join("\n\n")
-        try { await client.session.prompt({ path: { id: sid }, body: { parts: [{ type: "text", text }] } }) } catch {}
+        const prompts = []
+        for (const m of msgs) {
+          const raw = String(m.text || "").trim()
+          const mm = raw.match(/^\/model\s+(\S+)$/)
+          if (mm) {
+            const spec = mm[1]
+            const i = spec.indexOf("/")
+            if (i > 0) sessionModel.set(sid, { providerID: spec.slice(0, i), modelID: spec.slice(i + 1) })
+            send({ event: "stop", session_id: sid, model: spec })
+            continue
+          }
+          if (raw) prompts.push(raw)
+        }
+        if (!prompts.length) return
+        const body = { parts: [{ type: "text", text: prompts.join("\n\n") }] }
+        if (sessionModel.has(sid)) body.model = sessionModel.get(sid)
+        try { await client.session.prompt({ path: { id: sid }, body }) } catch {}
       })
     } catch {}
   }
@@ -34,9 +51,10 @@ export const JoeBro = async ({ directory, client }) => {
       const child = spawn(JOEBRO, ["report", "opencode"], { detached: true, stdio: ["pipe", "ignore", "ignore"] })
       child.on("error", () => {})
       child.stdin.on("error", () => {})
+      const inTmux = Boolean(process.env.TMUX_PANE)
       child.stdin.end(JSON.stringify({
         cwd: directory, pid: process.pid,
-        kitty_window_id: process.env.KITTY_WINDOW_ID, kitty_listen_on: process.env.KITTY_LISTEN_ON,
+        ...(inTmux ? {} : { kitty_window_id: process.env.KITTY_WINDOW_ID, kitty_listen_on: process.env.KITTY_LISTEN_ON }),
         tmux_pane: process.env.TMUX_PANE, ...ev,
       }))
       child.unref()
