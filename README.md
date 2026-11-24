@@ -6,7 +6,7 @@
 
 ## What's in here
 
-**Agent link.** Claude Code, Codex and opencode report what they're doing to your own JoeBro backend. They show up in the Mac app's Agents panel, the iPhone app and the Dynamic Island: working, waiting for your approval, finished. JoeBro can read what they're up to, queue them a follow-up that they pick up the moment their turn ends, and they can ping your phone when they're done or stuck.
+**Agent link.** Claude Code, Codex, opencode and Antigravity (`agy`) report what they're doing to your own JoeBro backend. They show up in the Mac app's Agents panel, the iPhone app and the Dynamic Island: working, waiting for your approval, finished. JoeBro can read what they're up to, queue them a follow-up that they pick up the moment their turn ends, and they can ping your phone when they're done or stuck.
 
 **Plugins.** A JoeBro plugin is a folder with a `joebro-plugin.json` manifest. It can give JoeBro new **tools**, an always-on **guardrail**, and its own **panel** in the Mac app. You can write one by hand, or ask JoeBro or any coding agent to build one for you. The standard is [SPEC.md](SPEC.md) (`joebro.plugin/1`).
 
@@ -18,6 +18,7 @@ repo
 ├── claude-code/           Claude Code plugin: hooks + the MCP server
 ├── opencode/joebro.js     opencode plugin
 ├── codex/                 Codex hooks + MCP setup
+├── agy/                   Antigravity (agy) hooks + MCP setup
 ├── SPEC.md                the plugin standard
 ├── runtime/               the reference plugin runtime (ships inside JoeBro)
 └── examples/plant-care/   a complete plugin: tools, guardrail and a panel
@@ -62,6 +63,12 @@ args = ["mcp"]</pre>
       <p><code>joebro-agents install --opencode</code> copies <code>opencode/joebro.js</code> into <code>~/.config/opencode/plugins/</code>. Queued messages arrive as a new prompt when the session goes idle.</p>
     </td>
     <td width="50%" valign="top">
+      <h3>Antigravity (<code>agy</code>)</h3>
+      <p><code>joebro-agents install --agy</code> adds the <code>joebro</code> hook group to <code>~/.gemini/config/hooks.json</code> and registers the MCP server in <code>~/.gemini/config/mcp_config.json</code>. Queued messages arrive mid-turn via <code>PreInvocation</code> or at <code>Stop</code>. More in <a href="agy/README.md">agy/README.md</a>.</p>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top">
       <h3>JoeBro itself</h3>
       <p>Add the same MCP server in JoeBro under <b>Tools → MCP</b> (command <code>joebro-agents</code>, args <code>mcp</code>). Then you can ask JoeBro to check on your agents, nudge one, or build a plugin.</p>
     </td>

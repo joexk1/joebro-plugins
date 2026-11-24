@@ -124,7 +124,7 @@ def run_session(host, task, claim):
     if not worker.installed(agent, commands):
         return {"node": host, "status": "failed", "error": "%s is not installed on %s" % (agent, host)}
     try:
-        if not shutil.which("tmux") and agent in ("claude", "opencode"):
+        if not shutil.which("tmux") and agent in ("claude", "opencode", "agy"):
             return run_headless(host, task, agent, commands)       # no tmux: still carry the session on (just not attachable)
         argv = worker.session_argv(agent, task["prompt"], task.get("model") or "", task.get("resume_id") or "", commands, task.get("permission") or "")
         name = "jb-" + task["id"][3:]

@@ -5,8 +5,8 @@ One stdlib-only file (Python 3.9+) that is, depending on how it is called:
 
   joebro-agents link <url> --token-file F     point this computer at your JoeBro backend
   joebro-agents status                        is it linked, is JoeBro reachable
-  joebro-agents install [--claude --codex --opencode]   add the hooks to your agents
-  joebro-agents report <claude|codex|opencode>          (hook) report one event, hand over queued messages
+  joebro-agents install [--claude --codex --opencode --agy]  add the hooks to your agents
+  joebro-agents report <claude|codex|opencode|agy>           (hook) report one event, hand over queued messages
   joebro-agents mcp                           MCP server: drive coding agents + build plugins
   joebro-agents ping "message" [--title T]    ping your phone through JoeBro
   joebro-agents agents                        list the coding agents JoeBro can see
@@ -100,11 +100,13 @@ def detect_harness():
         return "codex"
     if env.get("OPENCODE") or any(k.startswith("OPENCODE_") for k in env):
         return "opencode"
+    if env.get("ANTIGRAVITY_AGENT") or any(k.startswith("ANTIGRAVITY_") for k in env):
+        return "agy"
     return "agent"
 
 
 # ----------------------------------------------------------------------------- hook reporter
-SPAWN_TOOLS = ("spawn_agent", "spawn_agents", "Task", "Agent")
+SPAWN_TOOLS = ("spawn_agent", "spawn_agents", "Task", "Agent", "invoke_subagent")
 CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse": "tool", "PostToolUse": "tool_done",
               "PermissionRequest": "waiting", "Stop": "stop", "StopFailure": "stop", "SessionEnd": "end",
               "SubagentStart": "subagent_start", "SubagentStop": "subagent_stop"}
@@ -113,10 +115,12 @@ CLAUDE_MAP = {"SessionStart": "start", "UserPromptSubmit": "prompt", "PreToolUse
 def tool_text(inp):
     if not isinstance(inp, dict):
         return clip(inp, 120)
-    for k in ("description", "command", "file_path", "filePath", "path", "pattern", "url", "query", "prompt"):
+    for k in ("toolSummary", "description", "Description", "command", "CommandLine", "file_path", "filePath",
+              "path", "Path", "TargetFile", "AbsolutePath", "DirectoryPath", "pattern", "url", "query", "Query",
+              "prompt", "Prompt", "Role"):
         if inp.get(k):
             v = str(inp[k])
-            if k in ("file_path", "filePath", "path"):
+            if k in ("file_path", "filePath", "path", "Path", "TargetFile", "AbsolutePath", "DirectoryPath"):
                 v = os.path.basename(v.rstrip("/")) or v
             return clip(v, 120)
     return ""
@@ -234,10 +238,51 @@ def new_codex_text(path, sid):
     return "\n\n".join(reversed(found))
 
 
+def new_agy_text(path, sid):
+    """Assistant messages in an Antigravity transcript (PLANNER_RESPONSE.content) since the last report, oldest first."""
+    if not path or not os.path.isfile(str(path)):
+        return ""
+    mark = os.path.join(os.path.expanduser("~/.cache/joebro-agents"), "said-" + re.sub(r"[^A-Za-z0-9_-]", "_", sid)[:80])
+    try:
+        seen = open(mark).read().strip()
+    except OSError:
+        seen = ""
+    found, newest = [], ""
+    for line in reversed(_tail_lines(path)):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get("type") == "USER_INPUT":
+            break                          # reached the prompt
+        if row.get("type") != "PLANNER_RESPONSE":
+            continue
+        txt = str(row.get("content") or "").strip()
+        if not txt:
+            continue
+        uid = str(row.get("step_index") if row.get("step_index") is not None else row.get("created_at") or hash(txt))
+        if uid == seen:
+            break
+        newest = newest or uid
+        found.append(txt)
+    if not newest:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(mark), exist_ok=True)
+        open(mark, "w").write(newest)
+    except OSError:
+        pass
+    return "\n\n".join(reversed(found))
+
+
 def said_since(source, data, sid):
     try:
         if source == "codex":
             return new_codex_text(codex_rollout(data), sid)
+        if source == "agy":
+            return new_agy_text(data.get("transcriptPath") or data.get("transcript_path"), sid)
         return new_assistant_text(data.get("transcript_path"), sid)
     except Exception:
         return ""
@@ -276,6 +321,13 @@ def stop_notice(source, data):
             n = limit_notice(c)
             if n and (c is not cands[3] or len(str(c)) < 600):
                 return n
+        if source == "agy":
+            reason = str(data.get("terminationReason") or "")
+            if reason == "MAX_TOKEN_BUDGET_EXCEEDED":
+                return "Token budget exceeded"
+            if reason == "ERROR" and data.get("error"):
+                return clip(data.get("error"), 120)
+            return ""
         path = codex_rollout(data) if source == "codex" else data.get("transcript_path")
         if not path or not os.path.isfile(str(path)):
             return ""
@@ -302,7 +354,46 @@ def stop_notice(source, data):
         return ""
 
 
-QUESTION_TOOLS = {"AskUserQuestion", "request_user_input", "question"}
+QUESTION_TOOLS = {"AskUserQuestion", "request_user_input", "question", "ask_question"}
+
+
+def _ancestor_pid(target_comm):
+    """Find the enclosing harness process PID when hooks run via sh -c (Linux /proc, else ppid)."""
+    pid = os.getppid()
+    for _ in range(8):
+        try:
+            comm = open("/proc/%d/comm" % pid).read().strip()
+            if comm == target_comm:
+                return pid
+            stat_tail = open("/proc/%d/stat" % pid).read().rsplit(")", 1)[1].split()
+            ppid = int(stat_tail[1])
+            if ppid <= 1:
+                break
+            pid = ppid
+        except Exception:
+            break
+    return os.getppid()
+
+
+def _agy_continued(sid, set_to=None):
+    """Track whether our Stop hook just continued this Antigravity turn so the ensuing
+    PreInvocation does not re-report the previous user prompt as a duplicate."""
+    if not sid:
+        return False
+    path = _nudge_path(sid)
+    try:
+        st = json.load(open(path))
+    except Exception:
+        st = {"work": 0, "saved": False, "nudged": False}
+    prev = bool(st.get("continued"))
+    if set_to is not None and bool(set_to) != prev:
+        st["continued"] = bool(set_to)
+        try:
+            with open(path, "w") as f:
+                json.dump(st, f)
+        except Exception:
+            pass
+    return prev
 
 
 def normalise(source, data):
@@ -368,6 +459,69 @@ def normalise(source, data):
         elif ev == "stop":
             out["text"] = clip(data.get("last_assistant_message"), 4000)
         return out
+    if source == "agy":
+        name = data.get("hookEventName") or data.get("hook_event_name") or data.get("event") or ""
+        sid = str(data.get("conversationId") or data.get("session_id") or "")
+        wpaths = data.get("workspacePaths") if isinstance(data.get("workspacePaths"), list) else []
+        cwd = data.get("cwd") or (wpaths[0] if wpaths else "") or os.getcwd()
+        model = data.get("modelName") or data.get("model") or ""
+        tc = data.get("toolCall") if isinstance(data.get("toolCall"), dict) else {}
+        tname = str(tc.get("name") or data.get("tool_name") or "")
+        targs = tc.get("args") if isinstance(tc.get("args"), dict) else (data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {})
+        tpath = data.get("transcriptPath") or data.get("transcript_path") or ""
+        out = {"session_id": sid, "cwd": cwd, "model": model}
+        if name == "SessionStart":
+            out["event"] = "start"
+            return out
+        if name == "PreInvocation":
+            inv = int(data.get("invocationNum") or 0)
+            if inv == 0:
+                if _agy_continued(sid, set_to=False):
+                    out.update(event="prompt", _skip_post=True)
+                else:
+                    out.update(event="prompt", text=clip(data.get("lastUserInput"), 4000))
+                return out
+            out["event"] = "pre_invocation"
+            return out
+        if name == "PreToolUse":
+            if tname in QUESTION_TOOLS:
+                qs = targs.get("questions") if isinstance(targs.get("questions"), list) else []
+                q = (qs[0].get("question") if qs and isinstance(qs[0], dict) else "") or targs.get("question") or targs.get("prompt") or "a question"
+                out.update(event="waiting", text=clip("Question: " + str(q), 160))
+                return out
+            out.update(event="tool", tool=clip(tname, 60), text=tool_text(targs))
+            said = said_since("agy", data, sid)
+            if said:
+                out["said"] = clip(said, 4000)
+            elif tpath:
+                out["_recheck"] = tpath
+            if tname in SPAWN_TOOLS:
+                out["also"] = [{"event": "subagent_start",
+                                "session_id": "%s:sub:%s" % (sid, tc.get("id") or int(time.time() * 1000)),
+                                "parent_session_id": sid,
+                                "subagent_type": clip(targs.get("TypeName") or targs.get("agent_type") or "subagent", 40),
+                                "name": clip(targs.get("Role") or targs.get("name") or targs.get("Prompt"), 80),
+                                "ends_with_parent": True, "cwd": cwd}]
+            return out
+        if name == "PostToolUse":
+            out["event"] = "tool_done"
+            said = said_since("agy", data, sid)
+            if said:
+                out["said"] = clip(said, 4000)
+            return out
+        if name == "Stop":
+            out["event"] = "stop"
+            said = said_since("agy", data, sid)
+            if said:
+                out["said"] = clip(said, 4000)
+            notice = stop_notice("agy", data)
+            if notice:
+                out["notice"] = notice
+            return out
+        if name == "SessionEnd":
+            out["event"] = "end"
+            return out
+        return None
     if source == "opencode":   # the opencode plugin already normalises
         return data if data.get("event") else None
     return None
@@ -403,18 +557,28 @@ def cmd_report(source):
         return 0
     ev.update(source=source, host=cfg["host"])
     # Command channel: instructions queued for THIS agent are handed over here.
-    # Stop -> Claude/Codex carry on with them (decision:block + reason); prompt -> extra context.
-    # PostToolUse (Claude) -> delivered mid-turn as context, so a queued message lands within one tool step.
-    deliver = ("stop", "prompt", "tool_done") if source == "claude" else ("stop", "prompt")
-    nudge = nudge_track(source, data, ev) if source in ("claude", "codex") else ""
+    # Stop -> Claude/Codex carry on with them (decision:block + reason); Antigravity uses decision:continue + reason.
+    # PostToolUse (Claude) / PreInvocation (Antigravity) -> delivered mid-turn within one tool step.
+    deliver = ("stop", "prompt", "tool_done") if source == "claude" else ("stop", "prompt", "pre_invocation") if source == "agy" else ("stop", "prompt")
+    nudge = nudge_track(source, data, ev) if source in ("claude", "codex", "agy") else ""
     handed = False
-    if source in ("claude", "codex") and ev["event"] in deliver and not ev.get("parent_session_id"):
+    if source in ("claude", "codex", "agy") and ev["event"] in deliver and not ev.get("parent_session_id"):
         msgs = pull(cfg, cfg["host"], source, ev["session_id"],
                     {"stop": "stop_hook", "prompt": "prompt_hook"}.get(ev["event"], "tool_hook"))
         if msgs:
             handed = True
             text = handover_text(msgs)
-            if ev["event"] == "tool_done":
+            if source == "agy":
+                if ev["event"] == "stop":
+                    sys.stdout.write(json.dumps({"decision": "continue", "reason": text}))
+                    _agy_continued(ev["session_id"], set_to=True)
+                    ev.update(event="prompt", text=clip(text, 4000))
+                else:
+                    sys.stdout.write(json.dumps({"injectSteps": [{"userMessage": text}]}))
+                    if ev["event"] == "pre_invocation" or ev.get("_skip_post"):
+                        ev.pop("_skip_post", None)
+                        ev.update(event="prompt", text=clip(text, 4000))
+            elif ev["event"] == "tool_done":
                 sys.stdout.write(json.dumps({
                                              "hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": text}}))
                 ev.update(event="prompt", text=clip(text, 4000))
@@ -426,19 +590,28 @@ def cmd_report(source):
                                              "hookSpecificOutput": {"hookEventName": "UserPromptSubmit", "additionalContext": text}}))
             sys.stdout.flush()
     if nudge and not handed and ev["event"] == "stop":
-        sys.stdout.write(json.dumps({"decision": "block", "reason": nudge}))
+        if source == "agy":
+            sys.stdout.write(json.dumps({"decision": "continue", "reason": nudge}))
+            _agy_continued(ev["session_id"], set_to=True)
+        else:
+            sys.stdout.write(json.dumps({"decision": "block", "reason": nudge}))
         sys.stdout.flush()
     also = ev.pop("also", [])
-    if source in ("claude", "codex") and ev["event"] == "start" and memory_on(cfg):
+    if source in ("claude", "codex", "agy") and ev["event"] == "start" and memory_on(cfg):
         text = session_context(ev.get("cwd") or os.getcwd(), cfg, timeout=1.5)   # once per session: guide + <= 400-token brief
         if text:
-            sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
+            if source == "agy":
+                sys.stdout.write(json.dumps({"injectSteps": [{"systemMessage": {"systemMessage": text}}]}))
+            else:
+                sys.stdout.write(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": text}}))
             sys.stdout.flush()
+    if ev["event"] == "pre_invocation" or ev.pop("_skip_post", False):
+        return 0
     if ev["event"] in ("stop", "end") and not ev.get("branch"):
         ev["branch"] = _git(ev.get("cwd") or os.getcwd(), "symbolic-ref", "--short", "-q", "HEAD")
     if os.environ.get("JOEBRO_NIGHT_TASK"):
         ev["night_task"] = os.environ["JOEBRO_NIGHT_TASK"]
-    ev.setdefault("pid", os.getppid())
+    ev.setdefault("pid", _ancestor_pid("agy") if source == "agy" else os.getppid())
     in_tmux = bool(os.environ.get("TMUX_PANE"))
     for env, key in (("KITTY_WINDOW_ID", "kitty_window_id"), ("KITTY_LISTEN_ON", "kitty_listen_on"),
                      ("TMUX_PANE", "tmux_pane"), ("TERM_PROGRAM", "term")):
@@ -464,7 +637,7 @@ def cmd_report(source):
         api("POST", "/api/coding-agents/event", e, timeout=4, cfg=cfg)
     if recheck:
         time.sleep(1.5)
-        said = new_codex_text(recheck, ev["session_id"]) if source == "codex" else new_assistant_text(recheck, ev["session_id"])
+        said = new_codex_text(recheck, ev["session_id"]) if source == "codex" else new_agy_text(recheck, ev["session_id"]) if source == "agy" else new_assistant_text(recheck, ev["session_id"])
         if said:
             api("POST", "/api/coding-agents/event", {"event": "tool_done", "session_id": ev["session_id"], "source": source,
                                                       "host": cfg["host"], "said": clip(said, 4000), "pid": ev["pid"],
@@ -509,7 +682,7 @@ def provenance(cfg=None):
     cfg = cfg or config()
     return {"agent": detect_harness(), "host": cfg["host"], "source": "mcp",
             "model": os.environ.get("JOEBRO_MODEL") or os.environ.get("ANTHROPIC_MODEL") or "",
-            "session": os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("JOEBRO_NIGHT_TASK") or ""}
+            "session": os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("ANTIGRAVITY_CONVERSATION_ID") or os.environ.get("JOEBRO_NIGHT_TASK") or ""}
 
 
 def brief_text(cwd=None, cfg=None, timeout=4):
@@ -535,7 +708,8 @@ def session_context(cwd=None, cfg=None, timeout=4):
 
 # ---- the save nudge: once per session, at Stop, if it did real work and saved nothing ----
 NUDGE_MIN_WORK = 3
-WORK_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "apply_patch", "shell", "exec_command", "write_stdin"}
+WORK_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "apply_patch", "shell", "exec_command", "write_stdin",
+              "run_command", "write_file", "edit_file", "write_to_file", "replace_file_content", "multi_replace_file_content"}
 NUDGE_TEXT = (
     "Before you finish: did you learn anything durable this session that the next session, or a "
     "different agent, should know? A decision and why, a gotcha, a fix that worked, an approach that "
@@ -559,16 +733,19 @@ def nudge_track(source, data, ev):
         st = json.load(open(path))
     except Exception:
         st = {"work": 0, "saved": False, "nudged": False}
-    tool = str(data.get("tool_name") or "")
+    tc = data.get("toolCall") if isinstance(data.get("toolCall"), dict) else {}
+    tool = str(data.get("tool_name") or tc.get("name") or "")
+    hook_ev = data.get("hook_event_name") or data.get("hookEventName") or ""
     changed = False
-    if tool and ev["event"] in ("tool", "tool_done") and data.get("hook_event_name") == "PreToolUse":
+    if tool and ev["event"] in ("tool", "tool_done") and hook_ev == "PreToolUse":
         if "memory_remember" in tool or "memory_supersede" in tool:
             st["saved"] = True; changed = True
         elif tool in WORK_TOOLS:
             st["work"] += 1; changed = True
     out = ""
-    if (ev["event"] == "stop" and not st["saved"] and not st["nudged"] and st["work"] >= NUDGE_MIN_WORK
-            and not data.get("stop_hook_active")):
+    continuing = bool(data.get("stop_hook_active") or data.get("continuationActive")
+                      or (source == "agy" and int(data.get("executionNum") or 0) > 0))
+    if ev["event"] == "stop" and not st["saved"] and not st["nudged"] and st["work"] >= NUDGE_MIN_WORK and not continuing:
         st["nudged"] = True; changed = True
         out = NUDGE_TEXT
     if changed:
@@ -651,8 +828,10 @@ def t_night_cancel(a):
 # learned memory (Claude Code's auto-memory folder). --include-instructions also reads facts out of
 # the instruction files, without changing them.
 REPO_MEMORY_FILES = [("CLAUDE.md", "claude"), ("CLAUDE.local.md", "claude"), (".claude/CLAUDE.md", "claude"),
-                     ("AGENTS.md", "codex"), ("AGENTS.override.md", "codex"), (".opencode/AGENTS.md", "opencode")]
-GLOBAL_MEMORY_FILES = [(".claude/CLAUDE.md", "claude"), (".codex/AGENTS.md", "codex"), (".config/opencode/AGENTS.md", "opencode")]
+                     ("AGENTS.md", "codex"), ("AGENTS.override.md", "codex"), (".opencode/AGENTS.md", "opencode"),
+                     ("GEMINI.md", "agy"), (".agents/rules/AGENTS.md", "agy")]
+GLOBAL_MEMORY_FILES = [(".claude/CLAUDE.md", "claude"), (".codex/AGENTS.md", "codex"), (".config/opencode/AGENTS.md", "opencode"),
+                       (".gemini/config/GEMINI.md", "agy")]
 POINTER_FILES = ("CLAUDE.md", "AGENTS.md")
 MEM_END = "<!-- joebro:memory:end -->"
 MEM_MARK = "<!-- joebro:memory:start -->"
@@ -920,7 +1099,7 @@ def tool(name, desc, props, required=(), read=False, fn=None, destructive=False)
 TOOLS = [
     tool("joebro_ping", "Ping the user's phone through JoeBro: when you finish something long, are blocked on them, or hit something they must know now. One short sentence; don't ping for routine progress (rate limited: one a minute).",
          {"message": S, "title": dict(S, description="optional short title; defaults to which agent/project you are")}, ["message"], fn=t_ping),
-    tool("coding_agents_list", "List the coding agents JoeBro can see (Claude Code, Codex, opencode...): status running/waiting(needs approval)/idle, project, last action. Start here.",
+    tool("coding_agents_list", "List the coding agents JoeBro can see (Claude Code, Codex, opencode, Antigravity...): status running/waiting(needs approval)/idle, project, last action. Start here.",
          {"harness": {"type": "string", "enum": ["claude", "codex", "opencode", "agy"]}, "host": S}, read=True, fn=t_list),
     tool("coding_agent_detail", "One agent's recent activity lines (prompts, tool calls, results).", ID, ["id"], read=True, fn=t_detail),
     tool("coding_agent_screen", "Read the agent's live terminal screen (needs terminal control on that computer); falls back to hook activity.",
@@ -946,7 +1125,7 @@ TOOLS = [
     tool("memory_project_brief", "This project's memory brief (as given at session start).", {}, read=True, fn=t_brief),
     tool("night_shift_add", "Queue a coding task to run unattended overnight in its own git worktree; the user reviews it in the morning. Never pushes.",
          {"prompt": S, "repo": S, "title": S,
-          "agent": {"type": "string", "enum": ["claude", "codex", "opencode", "any"]}, "model": S, "test_command": S,
+          "agent": {"type": "string", "enum": ["claude", "codex", "opencode", "agy", "any"]}, "model": S, "test_command": S,
           "window_start": S, "window_end": S}, ["prompt"], fn=t_night_add),
     tool("night_shift_list", "Night Shift tasks: queued, running or awaiting review.", {}, read=True, fn=t_night_list),
     tool("night_shift_cancel", "Cancel a queued Night Shift task, or stop a running one.", {"id": S}, ["id"], fn=t_night_cancel),
@@ -1204,56 +1383,117 @@ def _merge(path, events, source, remove=False):
     os.replace(tmp, path)
 
 
-def _wire_mcp(remove=False):
-    """Register the joebro MCP server (memory, night shift, agents) with Codex and OpenCode."""
+def _merge_agy(path, remove=False):
+    """Merge JoeBro's hook group into Antigravity's ~/.gemini/config/hooks.json without touching others."""
+    data = {}
+    if os.path.exists(path):
+        raw = _read(path).strip()
+        if raw:
+            data = json.loads(raw)
+        if not os.path.exists(path + ".before-joebro"):
+            shutil.copy2(path, path + ".before-joebro")
+    if remove:
+        data.pop("joebro", None)
+    else:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        cmd = os.path.join(HOME, ".local", "bin", "joebro-agents") + " report agy"
+        handler = {"type": "command", "command": cmd, "timeout": 5}
+        data["joebro"] = {
+            "SessionStart": [handler],
+            "PreInvocation": [handler],
+            "PreToolUse": [{"matcher": "*", "hooks": [handler]}],
+            "PostToolUse": [{"matcher": "*", "hooks": [handler]}],
+            "Stop": [handler],
+        }
+    tmp = path + ".tmp-joebro"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def _has_agy():
+    return (os.path.isdir(os.path.join(HOME, ".gemini", "config"))
+            or os.path.isdir(os.path.join(HOME, ".gemini", "antigravity-cli"))
+            or bool(shutil.which("agy")))
+
+
+def _wire_mcp(remove=False, want=None):
+    """Register the joebro MCP server (memory, night shift, agents) with Codex, OpenCode and Antigravity."""
     binary = os.path.join(HOME, ".local", "bin", "joebro-agents")
     done = []
-    toml = os.path.join(HOME, ".codex", "config.toml")
-    if os.path.isdir(os.path.dirname(toml)):
-        text = _read(toml)
-        old = '\n[mcp_servers.joebro]\ncommand = "%s"\nargs = ["mcp"]\n' % binary
-        block = old + 'env = { JOEBRO_HARNESS = "codex" }\n'
-        if remove and block in text:
-            with open(toml, "w") as f:
-                f.write(text.replace(block, ""))
-        elif remove and old in text:
-            with open(toml, "w") as f:
-                f.write(text.replace(old, ""))
-        elif not remove and old in text and block not in text:     # upgrade: tag who is writing
-            with open(toml, "w") as f:
-                f.write(text.replace(old, block))
-            done.append("Codex")
-        elif not remove and "[mcp_servers.joebro]" not in text:
-            with open(toml, "a") as f:
-                f.write(block)
-            done.append("Codex")
-    oc = os.path.join(HOME, ".config", "opencode", "opencode.json")
-    if os.path.isdir(os.path.dirname(oc)):
-        try:
-            data = json.loads(_read(oc) or "{}")
-        except ValueError:
-            data = None                 # JSONC or broken: leave it alone
-        if isinstance(data, dict):
-            mcp = data.setdefault("mcp", {})
-            want = {"type": "local", "command": [binary, "mcp"], "enabled": True,
-                    "environment": {"JOEBRO_HARNESS": "opencode"}}
-            changed = bool(mcp.pop("joebro", None)) if remove else mcp.get("joebro") != want
-            if not remove and changed:
-                mcp["joebro"] = want
-                done.append("OpenCode")
-            if changed:
-                if os.path.exists(oc) and not os.path.exists(oc + ".before-joebro"):
-                    shutil.copy2(oc, oc + ".before-joebro")
-                with open(oc, "w") as f:
-                    json.dump(data, f, indent=2)
-                    f.write("\n")
+    if want is None or "codex" in want:
+        toml = os.path.join(HOME, ".codex", "config.toml")
+        if os.path.isdir(os.path.dirname(toml)):
+            text = _read(toml)
+            old = '\n[mcp_servers.joebro]\ncommand = "%s"\nargs = ["mcp"]\n' % binary
+            block = old + 'env = { JOEBRO_HARNESS = "codex" }\n'
+            if remove and block in text:
+                with open(toml, "w") as f:
+                    f.write(text.replace(block, ""))
+            elif remove and old in text:
+                with open(toml, "w") as f:
+                    f.write(text.replace(old, ""))
+            elif not remove and old in text and block not in text:     # upgrade: tag who is writing
+                with open(toml, "w") as f:
+                    f.write(text.replace(old, block))
+                done.append("Codex")
+            elif not remove and "[mcp_servers.joebro]" not in text:
+                with open(toml, "a") as f:
+                    f.write(block)
+                done.append("Codex")
+    if want is None or "opencode" in want:
+        oc = os.path.join(HOME, ".config", "opencode", "opencode.json")
+        if os.path.isdir(os.path.dirname(oc)):
+            try:
+                data = json.loads(_read(oc) or "{}")
+            except ValueError:
+                data = None                 # JSONC or broken: leave it alone
+            if isinstance(data, dict):
+                mcp = data.setdefault("mcp", {})
+                want_oc = {"type": "local", "command": [binary, "mcp"], "enabled": True,
+                           "environment": {"JOEBRO_HARNESS": "opencode"}}
+                changed = bool(mcp.pop("joebro", None)) if remove else mcp.get("joebro") != want_oc
+                if not remove and changed:
+                    mcp["joebro"] = want_oc
+                    done.append("OpenCode")
+                if changed:
+                    if os.path.exists(oc) and not os.path.exists(oc + ".before-joebro"):
+                        shutil.copy2(oc, oc + ".before-joebro")
+                    with open(oc, "w") as f:
+                        json.dump(data, f, indent=2)
+                        f.write("\n")
+    if (want is None or "agy" in want) and _has_agy():
+        agy_mcp = os.path.join(HOME, ".gemini", "config", "mcp_config.json")
+        if os.path.isdir(os.path.dirname(agy_mcp)) or not remove:
+            try:
+                raw = _read(agy_mcp).strip()
+                data = json.loads(raw) if raw else {}
+            except ValueError:
+                data = None
+            if isinstance(data, dict):
+                servers = data.setdefault("mcpServers", {})
+                want_agy = {"command": binary, "args": ["mcp"], "env": {"JOEBRO_HARNESS": "agy"}}
+                changed = bool(servers.pop("joebro", None)) if remove else servers.get("joebro") != want_agy
+                if not remove and changed:
+                    servers["joebro"] = want_agy
+                    done.append("Antigravity")
+                if changed:
+                    os.makedirs(os.path.dirname(agy_mcp), exist_ok=True)
+                    if os.path.exists(agy_mcp) and not os.path.exists(agy_mcp + ".before-joebro"):
+                        shutil.copy2(agy_mcp, agy_mcp + ".before-joebro")
+                    tmp = agy_mcp + ".tmp-joebro"
+                    with open(tmp, "w") as f:
+                        json.dump(data, f, indent=2)
+                        f.write("\n")
+                    os.replace(tmp, agy_mcp)
     return done
 
 
 def cmd_install(argv):
-    """joebro-agents install [--claude] [--codex] [--opencode] [--uninstall]   (no flags = every agent found)"""
+    """joebro-agents install [--claude] [--codex] [--opencode] [--agy] [--uninstall]   (no flags = every agent found)"""
     remove = "--uninstall" in argv
-    want = {a.lstrip("-") for a in argv if a in ("--claude", "--codex", "--opencode")} or {"claude", "codex", "opencode"}
+    want = {a.lstrip("-") for a in argv if a in ("--claude", "--codex", "--opencode", "--agy")} or {"claude", "codex", "opencode", "agy"}
     bindir = os.path.join(HOME, ".local", "bin")
     me = os.path.realpath(__file__)
     if not remove:
@@ -1289,7 +1529,12 @@ def cmd_install(argv):
             print("opencode: plugin added -> " + dst)
         else:
             print("opencode: copy opencode/joebro.js from the joebro-plugins repo into " + d)
-    wired = _wire_mcp(remove)
+    if "agy" in want and _has_agy():
+        hooks_path = os.path.join(HOME, ".gemini", "config", "hooks.json")
+        if not remove or os.path.exists(hooks_path):
+            _merge_agy(hooks_path, remove)
+            print("Antigravity: hooks %s" % ("removed" if remove else "added -> " + hooks_path))
+    wired = _wire_mcp(remove, want)
     if wired:
         print("MCP server (shared memory, night shift, agents) added for: " + ", ".join(wired))
     return 0

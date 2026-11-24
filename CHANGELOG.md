@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Antigravity (`agy`) full support: lifecycle hooks (`SessionStart`, `PreInvocation`, `PreToolUse`, `PostToolUse`, `Stop`), transcript reply streaming, mid-turn and Stop queued message delivery, Shared Memory session brief injection and save nudge, subagent (`invoke_subagent`) and question (`ask_question`) reporting, global `hooks.json` + `mcp_config.json` installer (`joebro-agents install --agy`), and Night Shift / interactive session launch & resume in `jb_nightworker.py`.
 - Shared Memory gets used: every session starts with a short guide (check memory_recall before guessing, save durable facts with memory_remember the moment you learn them), shown even when the project has no memory yet, and in OpenCode's system prompt.
 - Save nudge: once per session, when an agent did real work (3+ edits or commands) and saved nothing, its Stop hook asks it to save anything durable or just stop. Never twice, never for subagents, off with JOEBRO_MEMORY=off.
 - Facts written from Codex and OpenCode are now tagged with the right agent (`JOEBRO_HARNESS` in the MCP registration; existing installs are upgraded by `install`) instead of the generic "agent".

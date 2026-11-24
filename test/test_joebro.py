@@ -82,7 +82,7 @@ class JoeBroCLITests(unittest.TestCase):
     def run_cli(self, *args, stdin="", argv0=None, env=None, cwd=None):
         e = dict(os.environ, HOME=self.home)
         for k in list(e):
-            if k.startswith(("JOEBRO_", "CLAUDE", "CODEX_", "OPENCODE")):
+            if k.startswith(("JOEBRO_", "CLAUDE", "CODEX_", "OPENCODE", "ANTIGRAVITY_")):
                 e.pop(k)
         e.update(env or {})
         cmd = [sys.executable, JOEBRO] if not argv0 else [sys.executable, "-c",
@@ -323,6 +323,121 @@ class JoeBroCLITests(unittest.TestCase):
         d = json.load(open(settings))
         self.assertEqual([h["command"] for g in d["hooks"]["Stop"] for h in g["hooks"]], ["/usr/bin/other-hook"])
         self.assertNotIn("SessionStart", d["hooks"])
+
+    def test_agy_hooks_transcript_handover_subagent_question_and_memory(self):
+        self.link()
+        d = self.repo()
+        # SessionStart injects Shared Memory brief via injectSteps.systemMessage
+        r = self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "SessionStart", "conversationId": "ag1", "cwd": d, "modelName": "gemini-4-neon-high"
+        }))
+        out = json.loads(r.stdout)
+        self.assertIn("make test", out["injectSteps"][0]["systemMessage"]["systemMessage"])
+        # PreInvocation invocationNum=0 reports user prompt
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreInvocation", "conversationId": "ag1", "cwd": d, "invocationNum": 0,
+            "lastUserInput": "fix the build", "modelName": "gemini-4-neon-high"
+        }))
+        # PreToolUse with invoke_subagent reports tool + subagent_start
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreToolUse", "conversationId": "ag1", "cwd": d,
+            "toolCall": {"id": "c1", "name": "invoke_subagent", "args": {"TypeName": "research", "Role": "Codebase Researcher", "Prompt": "find hooks"}}
+        }))
+        # PreToolUse with ask_question reports waiting
+        self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreToolUse", "conversationId": "ag1", "cwd": d,
+            "toolCall": {"id": "c2", "name": "ask_question", "args": {"questions": [{"question": "Which branch?"}]}}
+        }))
+        # Mid-turn PreInvocation delivers queued inbox message via injectSteps.userMessage
+        Fake.inbox.append({"from": "JoeBro", "text": "use main"})
+        r_mid = self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreInvocation", "conversationId": "ag1", "cwd": d, "invocationNum": 1, "lastUserInput": "fix the build"
+        }))
+        self.assertEqual(json.loads(r_mid.stdout), {"injectSteps": [{"userMessage": "use main"}]})
+        # Stop reads PLANNER_RESPONSE from transcriptPath and hands over queued message via decision:continue
+        tpath = os.path.join(self.home, "transcript_full.jsonl")
+        with open(tpath, "w") as f:
+            f.write(json.dumps({"step_index": 0, "type": "USER_INPUT", "content": "fix the build"}) + "\n")
+            f.write(json.dumps({"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Build is green now."}) + "\n")
+        Fake.inbox.append({"from": "JoeBro", "text": "also run lint"})
+        r_stop = self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "Stop", "conversationId": "ag1", "cwd": d, "transcriptPath": tpath,
+            "terminationReason": "NO_TOOL_CALL", "executionNum": 0, "continuationActive": False
+        }))
+        self.assertEqual(json.loads(r_stop.stdout), {"decision": "continue", "reason": "also run lint"})
+        # Next PreInvocation(invocationNum=0) right after Stop continue does NOT duplicate lastUserInput
+        r_after = self.run_cli("report", "agy", stdin=json.dumps({
+            "hookEventName": "PreInvocation", "conversationId": "ag1", "cwd": d, "invocationNum": 0,
+            "lastUserInput": "fix the build"
+        }))
+        self.assertEqual(r_after.stdout, "")
+        import time
+        for _ in range(60):
+            evs = [x[3] for x in Fake.log if x[1] == "/api/coding-agents/event" and x[3].get("source") == "agy"]
+            if len(evs) >= 6:
+                break
+            time.sleep(0.05)
+        kinds = [e["event"] for e in evs]
+        self.assertIn("start", kinds)
+        self.assertIn("tool", kinds)
+        self.assertIn("subagent_start", kinds)
+        self.assertIn("waiting", kinds)
+        waiting_ev = next(e for e in evs if e["event"] == "waiting")
+        self.assertEqual(waiting_ev["text"], "Question: Which branch?")
+        sub_ev = next(e for e in evs if e["event"] == "subagent_start")
+        self.assertEqual((sub_ev["parent_session_id"], sub_ev["subagent_type"], sub_ev["name"], sub_ev["ends_with_parent"]),
+                         ("ag1", "research", "Codebase Researcher", True))
+        said_ev = next((e for e in evs if e.get("said")), None)
+        self.assertIsNotNone(said_ev)
+        self.assertEqual(said_ev["said"], "Build is green now.")
+
+    def test_agy_install_merges_hooks_and_mcp_without_touching_others(self):
+        gcfg = os.path.join(self.home, ".gemini", "config")
+        os.makedirs(gcfg)
+        hooks_p = os.path.join(gcfg, "hooks.json")
+        mcp_p = os.path.join(gcfg, "mcp_config.json")
+        json.dump({"other-hook": {"Stop": [{"type": "command", "command": "/bin/true"}]}}, open(hooks_p, "w"))
+        json.dump({"mcpServers": {"other": {"command": "node", "args": ["s.js"]}}}, open(mcp_p, "w"))
+        for _ in range(2):
+            self.assertEqual(self.run_cli("install", "--agy").returncode, 0)
+        h = json.load(open(hooks_p))
+        self.assertIn("other-hook", h)
+        self.assertIn("joebro", h)
+        self.assertEqual(h["joebro"]["PreToolUse"][0]["matcher"], "*")
+        self.assertIn("report agy", h["joebro"]["Stop"][0]["command"])
+        m = json.load(open(mcp_p))
+        self.assertIn("other", m["mcpServers"])
+        self.assertEqual(m["mcpServers"]["joebro"]["env"]["JOEBRO_HARNESS"], "agy")
+        self.assertEqual(self.run_cli("install", "--agy", "--uninstall").returncode, 0)
+        h2 = json.load(open(hooks_p))
+        self.assertIn("other-hook", h2)
+        self.assertNotIn("joebro", h2)
+        m2 = json.load(open(mcp_p))
+        self.assertIn("other", m2["mcpServers"])
+        self.assertNotIn("joebro", m2["mcpServers"])
+
+    def test_agy_harness_detection_and_nightworker(self):
+        self.link()
+        r = self.run_cli("ping", "Antigravity done", env={"ANTIGRAVITY_AGENT": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        body = self.wait_for("/api/coding-agents/ping")[0][3]
+        self.assertEqual(body["source"], "agy")
+        sys.path.insert(0, os.path.join(ROOT, "runtime"))
+        import jb_nightworker as nw
+        self.assertEqual(nw.NAMES["agy"], "Antigravity")
+        argv = nw.agent_argv("agy", "do work", model="gemini-4-neon-high", resume_id="conv-1")
+        self.assertEqual(argv[:4], ["agy", "-p", "do work", "--output-format"])
+        self.assertIn("--model", argv)
+        self.assertIn("gemini-4-neon-high", argv)
+        self.assertEqual(argv[-2:], ["--resume", "conv-1"])
+        sargv = nw.session_argv("agy", prompt="hi", model="gemini-4-neon-high", resume_id="conv-1", permission="full")
+        self.assertIn("--dangerously-skip-permissions", sargv)
+        self.assertIn("--prompt-interactive", sargv)
+        self.assertIn("hi", sargv)
+        parsed = nw.parse_output(json.dumps({"conversation_id": "conv-9", "status": "SUCCESS", "response": "SUMMARY: All set.\nLEARNED: Use pytest for unit tests."}))
+        self.assertEqual(parsed["session_id"], "conv-9")
+        self.assertIn("All set.", parsed["summary"])
+        self.assertEqual(parsed["learned"], ["Use pytest for unit tests."])
 
 
 if __name__ == "__main__":
